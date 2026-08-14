@@ -1,7 +1,10 @@
-# Source placeholder
+# Production source
 
-Gameplay implementation has intentionally not started. The first production milestone is now specified in [`docs/technical/first-production-vertical-slice.md`](../docs/technical/first-production-vertical-slice.md).
+The production runtime uses Factorio's conventional mod layout at the repository root:
 
-Production will use native asynchronous pathfinding with bounded custom steering, hybrid field progress storage, and disposable rendering projections.
+- `control.lua` and `data.lua` are composition roots.
+- `prototypes/` contains the temporary planner and fixed tractor.
+- `scripts/` contains slice orchestration, field state, movement, and visuals.
+- `tests/` contains the isolated Factorio integration adapter and runner.
 
-Do not merge the isolated prototype branches or introduce AAI as a production dependency.
+The module boundaries and acceptance contract remain in [`docs/technical/first-production-vertical-slice.md`](../docs/technical/first-production-vertical-slice.md). This directory is retained as a pointer rather than a second source tree.

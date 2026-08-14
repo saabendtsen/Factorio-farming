@@ -2,11 +2,6 @@
 
 ## Active
 
-- [ ] **Implement the first production vertical slice** - deliver the one-field, one-tractor, one-lane architecture in `docs/technical/first-production-vertical-slice.md`.
-  - A player can define the fixed 64 × 16 field, create the fixed tractor/cultivator, and complete exactly one 64 × 4 lane after physical travel to its deterministic entrance.
-  - Authoritative range progress remains exact through pause/resume, save/load, stale callbacks, and tractor destruction/replacement; the completed result is 256/1,024 tiles (25%).
-  - Rendering rectangles rebuild from field state, bounded per-tick budgets are enforced, and no AAI dependency or postponed gameplay enters the production mod.
-
 - [ ] **Validate and benchmark the production slice** - run the specification's automated, Factorio integration, save/load, recovery, and five-minute performance gates.
   - All acceptance scenarios pass in production code, including interruption at 25%, 50%, and 75% of the lane and save/load in every controller phase.
   - Record commands, profiler method, average and p95 script update, and any tuned constants in the implementation PR without duplicating the spike result tables.
@@ -19,6 +14,11 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Implement the first production vertical slice~~ (2026-08-14)
+  - Added the one-field, one-tractor, one-lane production architecture from `docs/technical/first-production-vertical-slice.md`.
+  - Exact range progress, pause/resume, save/load recovery, destruction/replacement, disposable visuals, and bounded controller/path budgets pass the isolated Factorio integration harness.
+  - The completed reference result is exactly 256/1,024 tiles (25%); postponed gameplay and AAI remain out of scope.
 
 - [x] ~~Spike 2 — Field state and visuals~~ (2026-08-14)
   - GO with a hybrid architecture: coherent ranges plus packed fragmented chunks.
