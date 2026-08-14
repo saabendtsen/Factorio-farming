@@ -98,12 +98,14 @@ function field.create(id, surface_index, bounds, player_position)
   local strips = {}
   for index = 1, EXPECTED_SHORT do strips[index] = {} end
   local chunk_representations = {}
-  if horizontal then
-    chunk_representations["0:0"] = "ranges"
-    chunk_representations["1:0"] = "ranges"
-  else
-    chunk_representations["0:0"] = "ranges"
-    chunk_representations["0:1"] = "ranges"
+  local first_chunk_x = math.floor(bounds.left / 32)
+  local last_chunk_x = math.floor((bounds.right - 1) / 32)
+  local first_chunk_y = math.floor(bounds.top / 32)
+  local last_chunk_y = math.floor((bounds.bottom - 1) / 32)
+  for chunk_y = first_chunk_y, last_chunk_y do
+    for chunk_x = first_chunk_x, last_chunk_x do
+      chunk_representations[chunk_x .. ":" .. chunk_y] = "ranges"
+    end
   end
 
   return {
@@ -221,6 +223,23 @@ function field.completed_rectangles(work_field)
     end
   end
   return rectangles
+end
+
+function field.claim_lane(work_field, job_id, machine_id)
+  local claim = work_field.lane_claim
+  if claim then
+    return claim.job_id == job_id and claim.machine_id == machine_id
+  end
+  work_field.lane_claim = {lane = 1, job_id = job_id, machine_id = machine_id}
+  return true
+end
+
+function field.release_lane(work_field, job_id)
+  local claim = work_field.lane_claim
+  if not claim then return true end
+  if claim.job_id ~= job_id then return false end
+  work_field.lane_claim = nil
+  return true
 end
 
 field.constants = {long = EXPECTED_LONG, short = EXPECTED_SHORT, work_width = WORK_WIDTH}

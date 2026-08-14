@@ -38,6 +38,19 @@ local function run_pure_tests()
   equal(east.entrance.x, 64, "east entrance")
   equal(east.direction, -1, "east entrance work direction")
 
+  local shifted_bounds = assert(field.normalize_selection({
+    left_top = {x = 31, y = 31}, right_bottom = {x = 95, y = 47}
+  }))
+  local shifted = field.create(30, 1, shifted_bounds, {x = 0, y = 39})
+  local chunk_count = 0
+  for _ in pairs(shifted.chunk_representations) do chunk_count = chunk_count + 1 end
+  equal(chunk_count, 6, "world-aligned chunk representation tags")
+  truthy(field.claim_lane(shifted, 10, 20), "first lane claim")
+  equal(field.claim_lane(shifted, 11, 21), false, "conflicting lane claim accepted")
+  truthy(field.claim_lane(shifted, 10, 20), "idempotent lane claim")
+  equal(field.release_lane(shifted, 11), false, "non-owner released lane claim")
+  truthy(field.release_lane(shifted, 10), "owner lane release")
+
   local vertical_bounds = assert(field.normalize_selection({
     left_top = {x = 0, y = 0}, right_bottom = {x = 16, y = 64}
   }))

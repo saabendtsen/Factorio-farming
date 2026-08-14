@@ -49,7 +49,8 @@ local function surface_state(surface_index)
 end
 
 local function notify(player, message)
-  if player and player.valid then player.print({"", "[Factorio Farming] ", message}) end
+  local formatted = {"", "[Factorio Farming] ", message}
+  if player and player.valid then player.print(formatted) else game.print(formatted) end
 end
 
 local function create_machine(surface, force, position)
@@ -97,6 +98,7 @@ local function fail_job(state, reason, player)
   if job and job.state ~= "completed" then
     if transitions[job.state] and transitions[job.state].failed then slice.transition(job, "failed") else job.state = "failed" end
     job.failure = reason
+    if state.field then field_module.release_lane(state.field, job.id) end
     job.machine_id = nil
     job.lane_claim = nil
   end
@@ -121,8 +123,9 @@ local function reserve_job(state)
   local job = state.job
   local machine = state.machine
   if not job or not machine or job.state ~= "waiting" then return false end
+  if not field_module.claim_lane(state.field, job.id, machine.id) then return false end
   job.machine_id = machine.id
-  job.lane_claim = {field_id = state.field.id, lane = 1}
+  job.lane_claim = 1
   machine.job_id = job.id
   slice.transition(job, "reserved")
   begin_travel(state)
@@ -265,8 +268,12 @@ local function resume_state(state, player)
     return false
   end
 
+  if not field_module.claim_lane(state.field, job.id, machine.id) then
+    notify(player, "The cultivation lane is already claimed.")
+    return false
+  end
   job.machine_id = machine.id
-  job.lane_claim = {field_id = state.field.id, lane = 1}
+  job.lane_claim = 1
   job.failure = nil
   job.generation = job.generation + 1
   machine.job_id = job.id
@@ -307,6 +314,7 @@ complete_job = function(state)
   local machine = state.machine
   movement.stop(machine)
   slice.transition(job, "completed")
+  field_module.release_lane(state.field, job.id)
   job.machine_id = nil
   job.lane_claim = nil
   machine.job_id = nil
