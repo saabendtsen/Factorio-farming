@@ -2,13 +2,6 @@
 
 ## Active
 
-- [ ] **Spike 2 — Field state and visuals**
-  - Prototype compressed strip/range state.
-  - Support interruption, resume, and overlap.
-  - Test fields up to 1,024 × 1,024.
-  - Compare batched tiles with compressed rendering ranges.
-  - Measure script time, save size, and load time.
-
 ## Waiting On
 
 ## Someday
@@ -17,6 +10,11 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Spike 2 — Field state and visuals~~ (2026-08-14)
+  - GO with a hybrid architecture: coherent ranges plus packed fragmented chunks.
+  - Use compressed render overlays and bounded, amortized tile batches.
+  - Results: `docs/technical/spike-2-field-state-visuals-results.md`.
 
 - [x] ~~Spike 1 — Vehicle controller~~ (2026-08-14)
   - Conditional GO: 300/300 vehicles completed at an average 0.513 ms/update.
