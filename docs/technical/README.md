@@ -6,4 +6,6 @@ The investigation found no fundamental API blocker. [Spike 1 validated the minim
 
 Both go/no-go spikes required before gameplay implementation are complete.
 
+The [first production vertical slice](first-production-vertical-slice.md) fixes the next implementation milestone: one selected field, one tractor, physical travel, one persistent and resumable lane, and a disposable progress projection.
+
 See the repository [task tracker](../../TASKS.md) for current scope and status.
