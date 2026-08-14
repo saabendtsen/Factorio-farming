@@ -14,7 +14,7 @@ A Factorio mod focused on farming, automation, logistics, and production optimiz
 
 ## Current status
 
-Design / technical spikes complete
+Design and technical spikes complete; first production vertical slice specified
 
 No gameplay implementation yet.
 
@@ -25,6 +25,7 @@ No gameplay implementation yet.
 - [Machinery v0.1](docs/machinery_v0.1.md)
 - [Fields v0.1](docs/fields_v0.1.md)
 - [Technical feasibility v0.1](docs/technical/feasibility_v0.1.md)
+- [First production vertical slice](docs/technical/first-production-vertical-slice.md)
 
 ## Next milestone
 
@@ -35,6 +36,6 @@ Both go/no-go prototypes are complete:
 1. [Custom vehicle controller](docs/technical/spike-1-vehicle-controller-results.md): conditional GO through 300 active vehicles; production must rate-limit path requests.
 2. [Compressed field state and scalable visuals](docs/technical/spike-2-field-state-visuals-results.md): GO with ranges for coherent work, packed fragmented chunks, compressed render overlays, and bounded tile batches.
 
-The next milestone is to choose and implement the first production vertical slice without expanding into full gameplay at once.
+The next milestone is the [first production vertical slice](docs/technical/first-production-vertical-slice.md): one 64 × 16 field, one fixed tractor/cultivator, physical travel to the entrance, and one persistent, resumable 64 × 4 lane. Crops, economy, progression, multiple vehicles, and polished UI remain postponed.
 
 See [TASKS.md](TASKS.md) for current scope and status.
