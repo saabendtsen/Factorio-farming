@@ -1,0 +1,9 @@
+{
+  "name": "factorio-farming-field-spike",
+  "version": "0.1.0",
+  "title": "Factorio Farming Field State and Visuals Spike",
+  "author": "Factorio Farming contributors",
+  "description": "PROTOTYPE: compressed field state, tile projection, and rendering feasibility harness.",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1.0"]
+}
