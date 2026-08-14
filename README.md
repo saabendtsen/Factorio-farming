@@ -24,9 +24,15 @@ No gameplay implementation yet.
 - [Progression v0.1](docs/progression_v0.1.md)
 - [Machinery v0.1](docs/machinery_v0.1.md)
 - [Fields v0.1](docs/fields_v0.1.md)
+- [Technical feasibility v0.1](docs/technical/feasibility_v0.1.md)
 
 ## Next milestone
 
-Technical feasibility v0.1
+Technical spikes
 
-The next milestone is to investigate how the design can realistically be implemented in Factorio 2.x before committing to a software architecture.
+The feasibility investigation recommends proceeding with two go/no-go prototypes before full gameplay development:
+
+1. A custom vehicle controller using native asynchronous pathfinding.
+2. Compressed field state and scalable field visuals.
+
+See [TASKS.md](TASKS.md) for current scope and status.

@@ -2,14 +2,6 @@
 
 ## Active
 
-- [ ] **Consolidate technical feasibility documentation**
-  - Choose one canonical feasibility document.
-  - Reconcile:
-    - `docs/technical/TECHNICAL_FEASIBILITY_v0.1.md`
-    - `docs/technical/feasibility_v0.1.md`
-  - Update the root README and `docs/technical/README.md`, which still describe feasibility as unresolved.
-  - Do not delete either document without confirming the complete deletion target with the user.
-
 - [ ] **Spike 1 — Vehicle controller**
   - Build a minimal Factorio 2.1 mod skeleton.
   - Use native asynchronous pathfinding and custom car steering.
@@ -32,6 +24,10 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Consolidate technical feasibility documentation~~ (2026-08-14)
+  - Kept `docs/technical/feasibility_v0.1.md` as the canonical assessment.
+  - Removed the superseded duplicate after confirming the deletion target.
 
 - [x] ~~Document Factorio 2.x technical feasibility~~ (2026-08-14)
   - Merged in PR #2.
