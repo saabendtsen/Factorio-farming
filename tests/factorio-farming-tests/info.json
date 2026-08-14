@@ -1,0 +1,8 @@
+{
+  "name": "factorio-farming-tests",
+  "version": "0.1.0",
+  "title": "Factorio Farming Tests",
+  "author": "saabendtsen",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1", "factorio-farming = 0.1.0"]
+}

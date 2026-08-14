@@ -14,9 +14,7 @@ A Factorio mod focused on farming, automation, logistics, and production optimiz
 
 ## Current status
 
-Design and technical spikes complete; first production vertical slice specified
-
-No gameplay implementation yet.
+First production vertical slice implemented; full acceptance validation and benchmarking remain
 
 ## Current design docs
 
@@ -36,6 +34,8 @@ Both go/no-go prototypes are complete:
 1. [Custom vehicle controller](docs/technical/spike-1-vehicle-controller-results.md): conditional GO through 300 active vehicles; production must rate-limit path requests.
 2. [Compressed field state and scalable visuals](docs/technical/spike-2-field-state-visuals-results.md): GO with ranges for coherent work, packed fragmented chunks, compressed render overlays, and bounded tile batches.
 
-The next milestone is the [first production vertical slice](docs/technical/first-production-vertical-slice.md): one 64 × 16 field, one fixed tractor/cultivator, physical travel to the entrance, and one persistent, resumable 64 × 4 lane. Crops, economy, progression, multiple vehicles, and polished UI remain postponed.
+The [first production vertical slice](docs/technical/first-production-vertical-slice.md) now implements one 64 × 16 field, one fixed tractor/cultivator, physical travel to the entrance, and one persistent, resumable 64 × 4 lane. The next task is full save/load, recovery, and five-minute performance validation. Crops, economy, progression, multiple vehicle types, and polished UI remain postponed.
+
+Run the isolated Factorio 2.1 integration suite with `tests\run-factorio-tests.bat`. It uses temporary mods, saves, and script output below `%LOCALAPPDATA%\FactorioFarmingProductionTests` and does not touch personal Factorio data.
 
 See [TASKS.md](TASKS.md) for current scope and status.

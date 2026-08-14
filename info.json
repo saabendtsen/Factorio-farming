@@ -1,0 +1,9 @@
+{
+  "name": "factorio-farming",
+  "version": "0.1.0",
+  "title": "Factorio Farming",
+  "author": "saabendtsen",
+  "description": "Production architecture slice for physical, persistent field work.",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1"]
+}

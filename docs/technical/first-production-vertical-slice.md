@@ -1,6 +1,6 @@
 # First production vertical slice
 
-Status: implementation-ready
+Status: implemented; full acceptance validation pending
 
 Milestone: one field, one tractor, one cultivation lane
 
