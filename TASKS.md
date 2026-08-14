@@ -2,13 +2,6 @@
 
 ## Active
 
-- [ ] **Spike 1 — Vehicle controller**
-  - Build a minimal Factorio 2.1 mod skeleton.
-  - Use native asynchronous pathfinding and custom car steering.
-  - Support travel to a field entrance, one lane, and bounded stuck recovery.
-  - Benchmark 1, 10, 100, 200, and 300 active vehicles.
-  - Do not implement crops, economy, progression, or full gameplay.
-
 - [ ] **Spike 2 — Field state and visuals**
   - Prototype compressed strip/range state.
   - Support interruption, resume, and overlap.
@@ -24,6 +17,11 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Spike 1 — Vehicle controller~~ (2026-08-14)
+  - Conditional GO: 300/300 vehicles completed at an average 0.513 ms/update.
+  - Production must queue and rate-limit native path requests.
+  - Results: `docs/technical/spike-1-vehicle-controller-results.md`.
 
 - [x] ~~Consolidate technical feasibility documentation~~ (2026-08-14)
   - Kept `docs/technical/feasibility_v0.1.md` as the canonical assessment.

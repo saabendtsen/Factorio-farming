@@ -14,7 +14,7 @@ A Factorio mod focused on farming, automation, logistics, and production optimiz
 
 ## Current status
 
-Design / pre-prototype
+Design / technical prototyping
 
 No gameplay implementation yet.
 
@@ -30,9 +30,9 @@ No gameplay implementation yet.
 
 Technical spikes
 
-The feasibility investigation recommends proceeding with two go/no-go prototypes before full gameplay development:
+The first of two go/no-go prototypes is complete:
 
-1. A custom vehicle controller using native asynchronous pathfinding.
-2. Compressed field state and scalable field visuals.
+1. [Custom vehicle controller](docs/technical/spike-1-vehicle-controller-results.md): conditional GO through 300 active vehicles; production must rate-limit path requests.
+2. Compressed field state and scalable field visuals: next.
 
 See [TASKS.md](TASKS.md) for current scope and status.
