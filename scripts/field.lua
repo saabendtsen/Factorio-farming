@@ -97,6 +97,14 @@ function field.create(id, surface_index, bounds, player_position)
 
   local strips = {}
   for index = 1, EXPECTED_SHORT do strips[index] = {} end
+  local chunk_representations = {}
+  if horizontal then
+    chunk_representations["0:0"] = "ranges"
+    chunk_representations["1:0"] = "ranges"
+  else
+    chunk_representations["0:0"] = "ranges"
+    chunk_representations["0:1"] = "ranges"
+  end
 
   return {
     id = id,
@@ -110,6 +118,7 @@ function field.create(id, surface_index, bounds, player_position)
     lane_area = EXPECTED_LONG * WORK_WIDTH,
     completed_area = 0,
     representation = "ranges",
+    chunk_representations = chunk_representations,
     strips = strips,
     generation = 1
   }

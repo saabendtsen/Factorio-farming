@@ -17,7 +17,7 @@
 
 - [x] ~~Implement the first production vertical slice~~ (2026-08-14)
   - Added the one-field, one-tractor, one-lane production architecture from `docs/technical/first-production-vertical-slice.md`.
-  - Exact range progress, pause/resume, save/load recovery, destruction/replacement, disposable visuals, and bounded controller/path budgets pass the isolated Factorio integration harness.
+  - Exact range progress, pause/resume, initial-load recovery, destruction/replacement, disposable visuals, and bounded controller/path budgets pass the isolated Factorio integration harness.
   - The completed reference result is exactly 256/1,024 tiles (25%); postponed gameplay and AAI remain out of scope.
 
 - [x] ~~Spike 2 — Field state and visuals~~ (2026-08-14)

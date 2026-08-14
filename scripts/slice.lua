@@ -4,6 +4,8 @@ local visuals = require("scripts.visuals")
 
 local slice = {}
 local load_recovery_needed = false
+local start_lane
+local complete_job
 
 local transitions = {
   waiting = {reserved = true},
@@ -65,8 +67,6 @@ local function create_machine(surface, force, position)
     create_build_effect_smoke = false
   })
   if not entity then return nil, "The farming tractor could not be created." end
-  entity.insert({name = "rocket-fuel", count = 10})
-
   local machine = {
     id = root.next_machine_id,
     surface_index = surface.index,
@@ -189,7 +189,7 @@ local function recover_loaded_paths()
     elseif job and machine and job.state == "working" and movement.entity(machine) then
       machine.generation = machine.generation + 1
       job.generation = job.generation + 1
-      movement.begin_work(machine, lane_target(state.field))
+      start_lane(state)
     end
   end
 end
@@ -231,6 +231,15 @@ local function pause_state(state, player)
     return false
   end
   if job.state == "paused" then notify(player, "The farming job is already paused."); return true end
+  if job.state == "working" and machine.controller and machine.controller.work_position then
+    local entity = movement.entity(machine)
+    if entity then
+      local delta = field_module.commit(state.field,
+        field_module.work_rectangle(state.field, machine.controller.work_position, entity.position, false))
+      machine.controller.work_position = {x = entity.position.x, y = entity.position.y}
+      if delta > 0 then visuals.mark_dirty(state.field) end
+    end
+  end
   job.paused_from = job.state
   job.generation = job.generation + 1
   machine.generation = machine.generation + 1
@@ -266,7 +275,7 @@ local function resume_state(state, player)
   local entity = movement.entity(machine)
   if movement.distance(entity.position, state.field.entrance) <= 1 then
     slice.transition(job, "working")
-    movement.begin_work(machine, lane_target(state.field))
+    movement.begin_alignment(machine, lane_target(state.field))
   else
     begin_travel(state)
   end
@@ -278,7 +287,22 @@ function slice.resume(player)
   return resume_state(surface_state(player.surface.index), player)
 end
 
-local function complete_job(state)
+start_lane = function(state)
+  local next_position = field_module.next_uncovered(state.field)
+  if not next_position then
+    complete_job(state)
+    return
+  end
+  local machine = state.machine
+  local entity = movement.entity(machine)
+  if movement.distance(entity.position, next_position) <= 1 then
+    movement.begin_work(machine, lane_target(state.field))
+  else
+    movement.begin_lane_positioning(machine, next_position)
+  end
+end
+
+complete_job = function(state)
   local job = state.job
   local machine = state.machine
   movement.stop(machine)
@@ -299,6 +323,10 @@ local function handle_outcome(state, outcome)
     fail_job(state, outcome.reason or "The assigned tractor is no longer available.")
   elseif outcome.type == "arrived" and outcome.purpose == "entrance" and job.state == "travelling" then
     slice.transition(job, "working")
+    movement.begin_alignment(machine, lane_target(state.field))
+  elseif outcome.type == "aligned" and job.state == "working" then
+    start_lane(state)
+  elseif outcome.type == "arrived" and outcome.purpose == "lane-start" and job.state == "working" then
     movement.begin_work(machine, lane_target(state.field))
   elseif outcome.type == "progress" and job.state == "working" then
     local delta = field_module.commit(state.field, field_module.work_rectangle(state.field, outcome.from, outcome.to, false))

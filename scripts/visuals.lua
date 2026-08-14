@@ -6,6 +6,7 @@ local MAX_PROJECTIONS_PER_TICK = 8
 local function root()
   storage.farming.visuals = storage.farming.visuals or {}
   storage.farming.visual_dirty = storage.farming.visual_dirty or {}
+  storage.farming.visual_builds = storage.farming.visual_builds or {}
   return storage.farming
 end
 
@@ -16,7 +17,9 @@ local function destroy_objects(objects)
 end
 
 function visuals.mark_dirty(work_field)
-  root().visual_dirty[work_field.id] = work_field.surface_index
+  local state = root()
+  state.visual_dirty[work_field.id] = work_field.surface_index
+  state.visual_builds[work_field.id] = nil
 end
 
 local function rectangle_spec(rectangle, color, filled, width)
@@ -65,21 +68,31 @@ function visuals.update()
     return
   end
 
-  destroy_objects(state.visuals[field_id])
-  state.visuals[field_id] = {}
-  local surface = game.get_surface(surface_index)
-  local specs = build_specs(work_field)
-  for index = 1, math.min(#specs, MAX_PROJECTIONS_PER_TICK) do
-    specs[index].surface = surface
-    state.visuals[field_id][#state.visuals[field_id] + 1] = rendering.draw_rectangle(specs[index])
+  local build = state.visual_builds[field_id]
+  if not build then
+    destroy_objects(state.visuals[field_id])
+    state.visuals[field_id] = {}
+    build = {specs = build_specs(work_field), next_index = 1}
+    state.visual_builds[field_id] = build
   end
-  state.visual_dirty[field_id] = nil
+  local surface = game.get_surface(surface_index)
+  local last_index = math.min(#build.specs, build.next_index + MAX_PROJECTIONS_PER_TICK - 1)
+  for index = build.next_index, last_index do
+    build.specs[index].surface = surface
+    state.visuals[field_id][#state.visuals[field_id] + 1] = rendering.draw_rectangle(build.specs[index])
+  end
+  build.next_index = last_index + 1
+  if build.next_index > #build.specs then
+    state.visual_dirty[field_id] = nil
+    state.visual_builds[field_id] = nil
+  end
 end
 
 function visuals.clear(field_id)
   local state = root()
   destroy_objects(state.visuals[field_id])
   state.visuals[field_id] = {}
+  state.visual_builds[field_id] = nil
 end
 
 function visuals.rebuild(work_field)
