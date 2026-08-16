@@ -1,5 +1,9 @@
 local field = require("__factorio-farming__/scripts/field")
 local slice = require("__factorio-farming__/scripts/slice")
+local mode = require("mode")
+
+local BENCH_TICKS = 18000
+local PROFILE_DELAY = 10
 
 local function fail(message)
   error("FACTORIO_FARMING_TEST_FAILURE: " .. message)
@@ -13,6 +17,15 @@ end
 
 local function truthy(value, message)
   if not value then fail(message) end
+end
+
+local function write_result(name, result)
+  helpers.write_file(
+    "factorio-farming-tests/" .. name .. ".json",
+    helpers.table_to_json(result),
+    false
+  )
+  log("FACTORIO_FARMING_TEST_RESULT " .. name .. " " .. helpers.table_to_json(result))
 end
 
 local function run_pure_tests()
@@ -82,46 +95,57 @@ local function run_pure_tests()
   truthy(slice.transition(job, "travelling"), "reserved to travelling transition")
   local transitioned = slice.transition(job, "completed")
   equal(transitioned, false, "invalid transition accepted")
+
+  local paused_job = {state = "working"}
+  truthy(slice.transition(paused_job, "paused"), "working to paused transition")
+  truthy(slice.transition(paused_job, "working"), "paused to working transition")
 end
 
-local function write_result(result)
-  helpers.write_file(
-    "factorio-farming-tests/result.json",
-    helpers.table_to_json(result),
-    false
-  )
-  log("FACTORIO_FARMING_TEST_RESULT " .. helpers.table_to_json(result))
+local function build_surface(name)
+  local surface = game.create_surface("farming-production-slice-test-" .. name, {
+    width = 256,
+    height = 256,
+    peaceful_mode = true,
+    autoplace_controls = {}
+  })
+  surface.generate_with_lab_tiles = true
+  surface.request_to_generate_chunks({x = 0, y = 0}, 4)
+  surface.force_generate_chunk_requests()
+  local test_tiles = {}
+  for y = -32, 31 do
+    for x = -32, 95 do
+      test_tiles[#test_tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
+    end
+  end
+  surface.set_tiles(test_tiles, true, true, true, false)
+  for _, entity in pairs(surface.find_entities_filtered({
+    type = {"tree", "simple-entity", "cliff", "resource", "unit", "unit-spawner", "turret"}
+  })) do
+    entity.destroy()
+  end
+  return surface
 end
 
-script.on_init(function()
-  run_pure_tests()
+local FIELD_BOUNDS = {left = 0, top = 0, right = 64, bottom = 16}
+local TRACTOR_POSITION = {x = -20, y = 8}
+
+local function setup_slice(surface_index, what)
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface_index,
+    FIELD_BOUNDS, TRACTOR_POSITION)
+  truthy(ok, message or (what .. " setup failed"))
+end
+
+local function snapshot(surface_index)
+  return remote.call("factorio_farming", "snapshot", surface_index)
+end
+
+-- ---------------------------------------------------------------- functional
+
+local function init_functional()
   storage.test_surfaces = {}
   for _, scenario in ipairs({"full", "pause", "destroy"}) do
-    local surface = game.create_surface("farming-production-slice-test-" .. scenario, {
-      width = 256,
-      height = 256,
-      peaceful_mode = true,
-      autoplace_controls = {}
-    })
-    surface.generate_with_lab_tiles = true
-    surface.request_to_generate_chunks({x = 0, y = 0}, 4)
-    surface.force_generate_chunk_requests()
-    local test_tiles = {}
-    for y = -32, 31 do
-      for x = -32, 95 do
-        test_tiles[#test_tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
-      end
-    end
-    surface.set_tiles(test_tiles, true, true, true, false)
-    for _, entity in pairs(surface.find_entities_filtered({
-      type = {"tree", "simple-entity", "cliff", "resource", "unit", "unit-spawner", "turret"}
-    })) do
-      entity.destroy()
-    end
-
-    local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
-      {left = 0, top = 0, right = 64, bottom = 16}, {x = -20, y = 8})
-    truthy(ok, message or (scenario .. " integration setup failed"))
+    local surface = build_surface(scenario)
+    setup_slice(surface.index, scenario)
     storage.test_surfaces[scenario] = surface.index
   end
   storage.test_started_tick = game.tick
@@ -130,15 +154,15 @@ script.on_init(function()
   storage.destroyed = false
   storage.replaced = false
   storage.visual_rebuild_started = false
-end)
+end
 
-script.on_event(defines.events.on_tick, function(event)
+local function drive_functional(event)
   local snapshots = {}
   for scenario, surface_index in pairs(storage.test_surfaces) do
-    snapshots[scenario] = remote.call("factorio_farming", "snapshot", surface_index)
+    snapshots[scenario] = snapshot(surface_index)
   end
   if event.tick - storage.test_started_tick >= 11000 then
-    write_result({passed = false, reason = "integration timeout", snapshots = snapshots})
+    write_result("result", {passed = false, reason = "integration timeout", snapshots = snapshots})
     fail("integration timeout")
   end
 
@@ -168,7 +192,7 @@ script.on_event(defines.events.on_tick, function(event)
   elseif storage.destroyed and not storage.replaced and destroyed.job.state == "failed" then
     equal(destroyed.field.completed_area, storage.destroyed_area, "tractor destruction changed progress")
     local replaced, replace_error = remote.call("factorio_farming", "debug_replace_tractor",
-      storage.test_surfaces.destroy, {x = -20, y = 8})
+      storage.test_surfaces.destroy, TRACTOR_POSITION)
     truthy(replaced, replace_error or "replacement tractor failed")
     truthy(remote.call("factorio_farming", "debug_resume", storage.test_surfaces.destroy), "replacement resume failed")
     storage.replaced = true
@@ -178,16 +202,16 @@ script.on_event(defines.events.on_tick, function(event)
      snapshots.destroy.job.state ~= "completed" then return end
 
   if not storage.visual_rebuild_started then
-    for scenario, snapshot in pairs(snapshots) do
-      equal(snapshot.field.completed_area, 256, scenario .. " completed area")
-      equal(snapshot.field.total_area, 1024, scenario .. " field area")
-      equal(snapshot.job.machine_id, nil, scenario .. " completed job machine claim")
-      equal(snapshot.job.has_claim, false, scenario .. " completed job lane claim")
-      equal(snapshot.machine.job_id, nil, scenario .. " completed machine assignment")
+    for scenario, snap in pairs(snapshots) do
+      equal(snap.field.completed_area, 256, scenario .. " completed area")
+      equal(snap.field.total_area, 1024, scenario .. " field area")
+      equal(snap.job.machine_id, nil, scenario .. " completed job machine claim")
+      equal(snap.job.has_claim, false, scenario .. " completed job lane claim")
+      equal(snap.machine.job_id, nil, scenario .. " completed machine assignment")
     end
     equal(snapshots.full.pending_path_count, 0, "completed jobs pending paths")
     remote.call("factorio_farming", "clear_visuals", storage.test_surfaces.full)
-    local cleared = remote.call("factorio_farming", "snapshot", storage.test_surfaces.full)
+    local cleared = snapshot(storage.test_surfaces.full)
     equal(cleared.visual_count, 0, "visual clear hook")
     equal(cleared.field.completed_area, 256, "visual clear changed authoritative progress")
     remote.call("factorio_farming", "rebuild_visuals", storage.test_surfaces.full)
@@ -199,7 +223,7 @@ script.on_event(defines.events.on_tick, function(event)
   if event.tick <= storage.visual_rebuild_tick then return end
   truthy(snapshots.full.visual_count >= 4, "visual rebuild did not restore projections")
   equal(snapshots.full.field.completed_area, 256, "visual rebuild changed authoritative progress")
-  write_result({
+  write_result("result", {
     passed = true,
     tick = event.tick,
     completed_area = snapshots.full.field.completed_area,
@@ -208,8 +232,227 @@ script.on_event(defines.events.on_tick, function(event)
     pure_tests = "passed",
     integration = "passed",
     pause_resume_checkpoints = 3,
-    destruction_replacement = "passed",
-    save_load = "passed during initial travel"
+    destruction_replacement = "passed"
   })
   script.on_event(defines.events.on_tick, nil)
+end
+
+-- ------------------------------------------------------------------ capture
+
+local function init_capture()
+  storage.capture = {
+    surface = build_surface("capture").index,
+    step = 1,
+    saved = {},
+    started = game.tick
+  }
+end
+
+-- Freezes the current state into a named save. `test_capture` travels inside the
+-- save and tells the replay driver which phase it is looking at.
+local function save_phase(capture, phase, snap, tick)
+  storage.test_capture = phase
+  storage.capture_area = snap and snap.field.completed_area or 0
+  storage.capture_generation = snap and snap.machine.generation or 0
+  storage.capture_job_state = snap and snap.job.state or "none"
+  storage.capture_surface = capture.surface
+  capture.saved[#capture.saved + 1] = phase
+  capture.step = capture.step + 1
+  capture.cooldown = tick + 2
+  game.auto_save("phase-" .. phase)
+end
+
+local function drive_capture(event)
+  local capture = storage.capture
+  if capture.done then return end
+  if capture.cooldown and event.tick < capture.cooldown then return end
+  if event.tick - capture.started > 60000 then
+    write_result("capture", {passed = false, reason = "capture timeout", step = capture.step})
+    fail("capture timeout at step " .. capture.step)
+  end
+
+  if capture.step == 1 then
+    setup_slice(capture.surface, "capture")
+    local snap = snapshot(capture.surface)
+    -- Proves `reserved` is a real observable phase, not a step inside setup.
+    equal(snap.job.state, "reserved", "capture job did not settle in reserved")
+    save_phase(capture, "reserved", snap, event.tick)
+    return
+  end
+
+  local snap = snapshot(capture.surface)
+
+  if capture.step == 2 then
+    if snap.job.state == "travelling" and snap.machine.controller_state == "following" then
+      save_phase(capture, "travelling", snap, event.tick)
+    end
+  elseif capture.step == 3 then
+    if snap.job.state == "working" and snap.field.completed_area >= 64 then
+      save_phase(capture, "working", snap, event.tick)
+    end
+  elseif capture.step == 4 then
+    truthy(remote.call("factorio_farming", "debug_pause", capture.surface), "capture pause failed")
+    capture.step = 5
+    capture.cooldown = event.tick + 2
+  elseif capture.step == 5 then
+    equal(snap.job.state, "paused", "capture job did not pause")
+    save_phase(capture, "paused", snap, event.tick)
+  elseif capture.step == 6 then
+    -- A separate, untouched slice carries the performance reference run. The
+    -- paused capture slice stays paused so only one job is active in it.
+    storage.bench_surface = build_surface("bench").index
+    capture.step = 7
+    capture.cooldown = event.tick + 2
+  elseif capture.step == 7 then
+    setup_slice(storage.bench_surface, "bench")
+    save_phase(capture, "benchmark", snapshot(storage.bench_surface), event.tick)
+  elseif capture.step == 8 then
+    capture.done = true
+    write_result("capture", {passed = true, tick = event.tick, saved = capture.saved})
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
+-- ------------------------------------------------------------------- replay
+
+local verify = {}
+local bench = {}
+
+local function drive_verify(event, phase)
+  if verify.done then return end
+  local surface = storage.capture_surface
+  local snap = snapshot(surface)
+
+  if not verify.started then
+    verify.started = event.tick
+    -- The load itself must neither lose nor inflate authoritative progress.
+    equal(snap.field.completed_area, storage.capture_area, phase .. " load changed progress")
+    equal(snap.field.total_area, 1024, phase .. " field area after load")
+    truthy(snap.machine.valid, phase .. " tractor invalid after load")
+    -- Generations move on so any callback from the pre-save session is stale.
+    truthy(snap.machine.generation > storage.capture_generation,
+      phase .. " did not invalidate pre-save callbacks")
+    -- The one-outstanding-request budget still holds immediately after a load.
+    truthy(snap.pending_path_count <= 1, phase .. " exceeded the outstanding path budget after load")
+    if phase == "reserved" or phase == "travelling" then
+      -- The saved request is discarded and a fresh one is issued, rather than
+      -- the stale in-flight path being trusted.
+      equal(snap.machine.controller_state, "requesting", phase .. " did not reissue its path after load")
+    elseif phase == "working" then
+      equal(snap.job.state, "working", "working save did not load working")
+    elseif phase == "paused" then
+      equal(snap.job.state, "paused", "paused save did not load paused")
+      verify.hold_until = event.tick + 60
+    end
+    return
+  end
+
+  if phase == "paused" and not verify.resumed then
+    if event.tick < verify.hold_until then
+      equal(snap.job.state, "paused", "paused job left paused without resume")
+      equal(snap.field.completed_area, storage.capture_area, "paused job progressed without resume")
+      return
+    end
+    truthy(remote.call("factorio_farming", "debug_resume", surface), "resume after load failed")
+    verify.resumed = true
+    return
+  end
+
+  -- Below the harness tick budget so a stall reports itself instead of the run
+  -- simply ending without a result file.
+  if event.tick - verify.started > 15000 then
+    write_result("saveload-" .. phase, {
+      passed = false, reason = "timeout", state = snap.job.state,
+      completed_area = snap.field.completed_area
+    })
+    fail(phase .. " save/load run timed out")
+  end
+
+  if snap.job.state ~= "completed" then return end
+  equal(snap.field.completed_area, 256, phase .. " final completed area")
+  equal(snap.field.total_area, 1024, phase .. " final field area")
+  equal(snap.job.machine_id, nil, phase .. " completed job machine claim")
+  equal(snap.job.has_claim, false, phase .. " completed job lane claim")
+  equal(snap.machine.job_id, nil, phase .. " completed machine assignment")
+  equal(snap.pending_path_count, 0, phase .. " pending path after completion")
+  verify.done = true
+  write_result("saveload-" .. phase, {
+    passed = true,
+    phase = phase,
+    loaded_area = storage.capture_area,
+    completed_area = snap.field.completed_area,
+    total_area = snap.field.total_area,
+    ticks_after_load = event.tick - verify.started
+  })
+  script.on_event(defines.events.on_tick, nil)
+end
+
+local function drive_benchmark(event)
+  if bench.done then return end
+  local surface = storage.bench_surface
+  local snap = snapshot(surface)
+
+  if not bench.start then
+    bench.start = event.tick
+    return
+  end
+  if not bench.profiling then
+    -- Skip the load-recovery ticks so one-time setup is excluded.
+    if event.tick < bench.start + PROFILE_DELAY then return end
+    truthy(remote.call("factorio_farming", "debug_profile_start"), "profiler did not start")
+    bench.profiling = true
+    bench.profile_start = event.tick
+    return
+  end
+
+  if not bench.completed_tick and snap.job.state == "completed" then
+    bench.completed_tick = event.tick
+    equal(snap.field.completed_area, 256, "benchmark lane completed area")
+  end
+
+  if event.tick >= bench.profile_start + BENCH_TICKS then
+    local samples = remote.call("factorio_farming", "debug_profile_stop")
+    bench.done = true
+    equal(snap.job.state, "completed", "benchmark lane did not complete during the reference run")
+    write_result("benchmark", {
+      passed = true,
+      profile_start_tick = bench.profile_start,
+      profile_end_tick = event.tick,
+      profiled_ticks = event.tick - bench.profile_start,
+      samples = samples,
+      lane_completed_tick = bench.completed_tick,
+      completed_area = snap.field.completed_area,
+      total_area = snap.field.total_area
+    })
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
+local function drive_replay(event)
+  local phase = storage.test_capture
+  if not phase then fail("replayed save carries no captured phase") end
+  if phase == "benchmark" then drive_benchmark(event) else drive_verify(event, phase) end
+end
+
+-- ----------------------------------------------------------------- dispatch
+
+script.on_init(function()
+  run_pure_tests()
+  if mode == "capture" then
+    init_capture()
+  elseif mode == "functional" then
+    init_functional()
+  else
+    fail("mode '" .. tostring(mode) .. "' does not create a map")
+  end
+end)
+
+script.on_event(defines.events.on_tick, function(event)
+  if mode == "capture" then
+    drive_capture(event)
+  elseif mode == "replay" then
+    drive_replay(event)
+  else
+    drive_functional(event)
+  end
 end)

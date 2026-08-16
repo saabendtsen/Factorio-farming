@@ -2,9 +2,9 @@
 
 ## Active
 
-- [ ] **Validate and benchmark the production slice** - run the specification's automated, Factorio integration, save/load, recovery, and five-minute performance gates.
-  - All acceptance scenarios pass in production code, including interruption at 25%, 50%, and 75% of the lane and save/load in every controller phase.
-  - Record commands, profiler method, average and p95 script update, and any tuned constants in the implementation PR without duplicating the spike result tables.
+- [ ] **Cultivate the whole field** - extend the accepted one-lane slice to all four lanes and 1,024 tiles.
+  - Generate the remaining lanes and headland turns from field geometry, keeping exact coverage, one lane claim at a time, and the existing controller and path budgets.
+  - The field must reach exactly 1,024/1,024 tiles with no overlap inflation, and the phase save/load and five-minute gates must still pass.
 
 ## Waiting On
 
@@ -14,6 +14,12 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Validate and benchmark the production slice~~ (2026-08-16)
+  - Made `reserved` an observable phase and rebuilt load recovery per phase: in-flight path requests are always discarded, generations invalidate pre-save callbacks, and `paused`/`failed` stay stopped until an explicit resume.
+  - The harness now captures real saves in `reserved`, `travelling`, `working`, and `paused` on a headless server, replays each to exactly 256/1,024 tiles, and runs a five-minute profiled reference run.
+  - Active-job script update averaged 0.0183 ms with a 0.0597 ms p95, against 0.25 ms and 0.50 ms budgets. No constants needed tuning.
+  - Results: `docs/technical/first-production-vertical-slice.md`.
 
 - [x] ~~Implement the first production vertical slice~~ (2026-08-14)
   - Added the one-field, one-tractor, one-lane production architecture from `docs/technical/first-production-vertical-slice.md`.

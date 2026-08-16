@@ -4,6 +4,7 @@ local visuals = require("scripts.visuals")
 
 local slice = {}
 local load_recovery_needed = false
+local profile = nil
 local start_lane
 local complete_job
 
@@ -128,8 +129,24 @@ local function reserve_job(state)
   job.lane_claim = 1
   machine.job_id = job.id
   slice.transition(job, "reserved")
-  begin_travel(state)
   return true
+end
+
+-- `reserved` means the lane and tractor are claimed but no path request is in
+-- flight. Travel starts on the following controller tick so the state is a real,
+-- observable, save-able phase rather than a transient step inside setup.
+local function promote_reserved(root)
+  local indexes = {}
+  for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
+  table.sort(indexes)
+  for _, index in ipairs(indexes) do
+    local state = root.surfaces[index]
+    local job = state.job
+    local machine = state.machine
+    if job and machine and job.state == "reserved" and movement.entity(machine) then
+      begin_travel(state)
+    end
+  end
 end
 
 local function create_field_job(surface_index, bounds, player_position)
@@ -174,26 +191,52 @@ function slice.on_load()
   load_recovery_needed = true
 end
 
-local function recover_loaded_paths()
+-- Path requests never survive a save. Every in-flight request is dropped and the
+-- job is rebuilt from authoritative storage for its own phase, so a load is
+-- always a fresh, bounded attempt rather than trusted stale controller state.
+local function recover_loaded_state()
   if not load_recovery_needed then return end
   load_recovery_needed = false
   local root = ensure_root()
   root.path_queue = {}
   root.pending_paths = {}
   root.outstanding_path_id = nil
-  for _, state in pairs(root.surfaces) do
+
+  local indexes = {}
+  for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
+  table.sort(indexes)
+  for _, index in ipairs(indexes) do
+    local state = root.surfaces[index]
     local job = state.job
     local machine = state.machine
-    if job and machine and (job.state == "reserved" or job.state == "travelling") and movement.entity(machine) then
-      machine.generation = machine.generation + 1
-      job.generation = job.generation + 1
-      job.state = "reserved"
-      begin_travel(state)
-    elseif job and machine and job.state == "working" and movement.entity(machine) then
-      machine.generation = machine.generation + 1
-      job.generation = job.generation + 1
-      start_lane(state)
+    if job and machine and job.state ~= "completed" then
+      if not movement.entity(machine) then
+        if job.state ~= "failed" then
+          fail_job(state, "The assigned tractor was missing after loading. Progress has been preserved.")
+        end
+      else
+        machine.generation = machine.generation + 1
+        job.generation = job.generation + 1
+        machine.controller = machine.controller or {state = "idle", recoveries = 0}
+        machine.controller.waypoints = nil
+        machine.controller.waypoint_index = nil
+        movement.stop(machine)
+
+        if job.state == "reserved" or job.state == "travelling" then
+          -- Re-enter the reserved phase; promote_reserved reissues the path.
+          job.state = "reserved"
+          machine.controller.state = "idle"
+        elseif job.state == "working" then
+          -- Re-derive lane motion from stored coverage, never from the saved
+          -- controller position, so no uncovered tile is skipped.
+          start_lane(state)
+        elseif job.state == "paused" or job.state == "failed" then
+          -- Stay stopped. Only an explicit resume may restart work.
+          machine.controller.state = "paused"
+        end
+      end
     end
+    if state.field then visuals.mark_dirty(state.field) end
   end
 end
 
@@ -355,17 +398,20 @@ function slice.on_path_finished(event)
   end
 end
 
-function slice.on_tick(event)
-  recover_loaded_paths()
-  movement.process_path_queue(event.tick)
+local function tick_body(event)
+  recover_loaded_state()
   local root = ensure_root()
+  promote_reserved(root)
+  movement.process_path_queue(event.tick)
   local surface_indexes = {}
   for index in pairs(root.surfaces) do surface_indexes[#surface_indexes + 1] = index end
   table.sort(surface_indexes)
   local due = {}
+  local active = 0
   for _, index in ipairs(surface_indexes) do
     local state = root.surfaces[index]
     if state.machine and state.job and state.job.state ~= "paused" and state.job.state ~= "failed" and state.job.state ~= "completed" then
+      active = active + 1
       if (event.tick + state.machine.id) % movement.constants.cadence == 0 then
         due[#due + 1] = state
       end
@@ -384,6 +430,33 @@ function slice.on_tick(event)
     handle_outcome(selected, movement.update(selected.machine, event.tick))
   end
   visuals.update()
+  return active
+end
+
+function slice.on_tick(event)
+  if not profile then
+    tick_body(event)
+    return
+  end
+  profile.sample.reset()
+  local active = tick_body(event)
+  profile.sample.stop()
+  profile.count = profile.count + 1
+  -- The sample is measured before this line, so logging never inflates it.
+  log({"", "FARMING_PROFILE ", tostring(event.tick), " ", tostring(active), " ", profile.sample})
+end
+
+-- Profiling is a debug-only facility. It is off unless a harness turns it on and
+-- costs one branch per tick otherwise.
+function slice.debug_profile_start()
+  profile = {sample = helpers.create_profiler(true), count = 0}
+  return true
+end
+
+function slice.debug_profile_stop()
+  local count = profile and profile.count or 0
+  profile = nil
+  return count
 end
 
 function slice.on_object_destroyed(event)
