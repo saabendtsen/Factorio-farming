@@ -42,8 +42,22 @@ local function run_pure_tests()
   equal(west.axis, "x", "horizontal axis")
   equal(west.entrance.x, 0, "west entrance")
   equal(west.entrance.y, 8, "west entrance midpoint")
-  equal(west.lane.top, 6, "centered lane top")
-  equal(west.lane.bottom, 10, "centered lane bottom")
+  equal(#west.lanes, 4, "whole field lane count")
+  equal(west.lanes[1].top, 0, "first lane top")
+  equal(west.lanes[1].bottom, 4, "first lane bottom")
+  equal(west.lanes[4].top, 12, "last lane top")
+  equal(west.lanes[4].bottom, 16, "last lane bottom")
+  equal(west.lane_index, 1, "first active lane")
+  equal(west.direction, 1, "first lane direction")
+  truthy(field.advance_lane(west), "second lane was not generated")
+  equal(west.lane_index, 2, "second active lane")
+  equal(west.direction, -1, "second lane direction")
+  local west_turn = field.headland_waypoints(west)
+  equal(#west_turn, 5, "headland waypoint count")
+  equal(west_turn[1].x, 66, "headland exits east field edge")
+  equal(west_turn[1].y, 2, "headland starts on completed lane center")
+  equal(west_turn[5].x, 64, "headland returns to east field edge")
+  equal(west_turn[5].y, 6, "headland ends on next lane center")
 
   local tie = field.create(2, 1, horizontal, {x = 32, y = 8})
   equal(tie.entrance.x, 0, "entrance tie chooses west")
@@ -63,6 +77,10 @@ local function run_pure_tests()
   truthy(field.claim_lane(shifted, 10, 20), "idempotent lane claim")
   equal(field.release_lane(shifted, 11), false, "non-owner released lane claim")
   truthy(field.release_lane(shifted, 10), "owner lane release")
+  truthy(field.advance_lane(shifted), "shifted field second lane")
+  truthy(field.claim_lane(shifted, 10, 20), "second lane claim")
+  equal(shifted.lane_claim.lane, 2, "claim follows active lane")
+  truthy(field.release_lane(shifted, 10), "second lane release")
 
   local vertical_bounds = assert(field.normalize_selection({
     left_top = {x = 0, y = 0}, right_bottom = {x = 16, y = 64}
@@ -70,6 +88,12 @@ local function run_pure_tests()
   local north = field.create(4, 1, vertical_bounds, {x = 8, y = 32})
   equal(north.axis, "y", "vertical axis")
   equal(north.entrance.y, 0, "entrance tie chooses north")
+  truthy(field.advance_lane(north), "vertical second lane")
+  local north_turn = field.headland_waypoints(north)
+  equal(north_turn[1].x, 2, "vertical headland starts on completed lane center")
+  equal(north_turn[1].y, 66, "vertical headland exits south field edge")
+  equal(north_turn[5].x, 6, "vertical headland ends on next lane center")
+  equal(north_turn[5].y, 64, "vertical headland returns to south field edge")
 
   local ranges = {}
   local delta
@@ -82,13 +106,22 @@ local function run_pure_tests()
   equal(#ranges, 1, "overlapping and adjacent intervals merge")
 
   local progress = field.create(5, 1, horizontal, {x = -10, y = 8})
-  equal(field.commit(progress, {left = 0, top = 6, right = 16, bottom = 10}), 64, "quarter-lane commit")
-  equal(field.commit(progress, {left = 8, top = 6, right = 16, bottom = 10}), 0, "overlap is idempotent")
+  equal(field.commit(progress, {left = 0, top = 0, right = 16, bottom = 4}), 64, "quarter-lane commit")
+  equal(field.commit(progress, {left = 8, top = 0, right = 16, bottom = 4}), 0, "overlap is idempotent")
   equal(field.next_uncovered(progress).x, 16, "resume begins at first uncovered position")
-  equal(field.commit(progress, {left = 16, top = 6, right = 64, bottom = 10}), 192, "resumed lane delta")
+  equal(field.commit(progress, {left = 16, top = 0, right = 64, bottom = 4}), 192, "resumed lane delta")
   equal(progress.completed_area, 256, "exact completed lane area")
   equal(field.next_uncovered(progress), nil, "completed lane has no uncovered point")
-  equal(#field.completed_rectangles(progress), 1, "coherent progress projects as one rectangle")
+  for lane_index = 2, 4 do
+    truthy(field.advance_lane(progress), "advance to lane " .. lane_index)
+    equal(field.commit(progress, progress.lane), 256, "lane " .. lane_index .. " exact delta")
+  end
+  equal(progress.completed_area, 1024, "exact completed field area")
+  equal(field.advance_lane(progress), false, "advanced past final lane")
+  local completed = field.completed_rectangles(progress)
+  equal(#completed, 1, "coherent field progress projects as one rectangle")
+  equal(completed[1].top, 0, "completed projection top")
+  equal(completed[1].bottom, 16, "completed projection bottom")
 
   local job = {state = "waiting"}
   truthy(slice.transition(job, "reserved"), "waiting to reserved transition")
@@ -143,7 +176,7 @@ end
 
 local function init_functional()
   storage.test_surfaces = {}
-  for _, scenario in ipairs({"full", "pause", "destroy"}) do
+  for _, scenario in ipairs({"full", "pause", "turn-pause", "destroy"}) do
     local surface = build_surface(scenario)
     setup_slice(surface.index, scenario)
     storage.test_surfaces[scenario] = surface.index
@@ -153,6 +186,8 @@ local function init_functional()
   storage.pause_until = nil
   storage.destroyed = false
   storage.replaced = false
+  storage.turn_paused = false
+  storage.turn_resumed = false
   storage.visual_rebuild_started = false
 end
 
@@ -198,12 +233,30 @@ local function drive_functional(event)
     storage.replaced = true
   end
 
+  local turn = snapshots["turn-pause"]
+  if not storage.turn_paused and turn.field.lane_index == 2 and
+     turn.machine.controller_state == "positioning" then
+    truthy(remote.call("factorio_farming", "debug_pause", storage.test_surfaces["turn-pause"]),
+      "headland pause failed")
+    storage.turn_paused = true
+    storage.turn_area = turn.field.completed_area
+    storage.turn_resume_tick = event.tick + 60
+  elseif storage.turn_paused and not storage.turn_resumed and event.tick >= storage.turn_resume_tick then
+    equal(turn.job.state, "paused", "headland job did not stay paused")
+    equal(turn.field.completed_area, storage.turn_area, "headland pause changed progress")
+    truthy(remote.call("factorio_farming", "debug_resume", storage.test_surfaces["turn-pause"]),
+      "headland resume failed")
+    local resumed = snapshot(storage.test_surfaces["turn-pause"])
+    equal(resumed.machine.controller_state, "positioning", "headland resume did not restore positioning")
+    storage.turn_resumed = true
+  end
+
   if snapshots.full.job.state ~= "completed" or snapshots.pause.job.state ~= "completed" or
-     snapshots.destroy.job.state ~= "completed" then return end
+     snapshots["turn-pause"].job.state ~= "completed" or snapshots.destroy.job.state ~= "completed" then return end
 
   if not storage.visual_rebuild_started then
     for scenario, snap in pairs(snapshots) do
-      equal(snap.field.completed_area, 256, scenario .. " completed area")
+      equal(snap.field.completed_area, 1024, scenario .. " completed area")
       equal(snap.field.total_area, 1024, scenario .. " field area")
       equal(snap.job.machine_id, nil, scenario .. " completed job machine claim")
       equal(snap.job.has_claim, false, scenario .. " completed job lane claim")
@@ -213,7 +266,7 @@ local function drive_functional(event)
     remote.call("factorio_farming", "clear_visuals", storage.test_surfaces.full)
     local cleared = snapshot(storage.test_surfaces.full)
     equal(cleared.visual_count, 0, "visual clear hook")
-    equal(cleared.field.completed_area, 256, "visual clear changed authoritative progress")
+    equal(cleared.field.completed_area, 1024, "visual clear changed authoritative progress")
     remote.call("factorio_farming", "rebuild_visuals", storage.test_surfaces.full)
     storage.visual_rebuild_started = true
     storage.visual_rebuild_tick = event.tick
@@ -222,7 +275,7 @@ local function drive_functional(event)
 
   if event.tick <= storage.visual_rebuild_tick then return end
   truthy(snapshots.full.visual_count >= 4, "visual rebuild did not restore projections")
-  equal(snapshots.full.field.completed_area, 256, "visual rebuild changed authoritative progress")
+  equal(snapshots.full.field.completed_area, 1024, "visual rebuild changed authoritative progress")
   write_result("result", {
     passed = true,
     tick = event.tick,
@@ -232,7 +285,8 @@ local function drive_functional(event)
     pure_tests = "passed",
     integration = "passed",
     pause_resume_checkpoints = 3,
-    destruction_replacement = "passed"
+    destruction_replacement = "passed",
+    headland_pause_resume = "passed"
   })
   script.on_event(defines.events.on_tick, nil)
 end
@@ -363,13 +417,13 @@ local function drive_verify(event, phase)
   if event.tick - verify.started > 15000 then
     write_result("saveload-" .. phase, {
       passed = false, reason = "timeout", state = snap.job.state,
-      completed_area = snap.field.completed_area
+      completed_area = snap.field.completed_area, snapshot = snap
     })
     fail(phase .. " save/load run timed out")
   end
 
   if snap.job.state ~= "completed" then return end
-  equal(snap.field.completed_area, 256, phase .. " final completed area")
+  equal(snap.field.completed_area, 1024, phase .. " final completed area")
   equal(snap.field.total_area, 1024, phase .. " final field area")
   equal(snap.job.machine_id, nil, phase .. " completed job machine claim")
   equal(snap.job.has_claim, false, phase .. " completed job lane claim")
@@ -407,20 +461,20 @@ local function drive_benchmark(event)
 
   if not bench.completed_tick and snap.job.state == "completed" then
     bench.completed_tick = event.tick
-    equal(snap.field.completed_area, 256, "benchmark lane completed area")
+    equal(snap.field.completed_area, 1024, "benchmark field completed area")
   end
 
   if event.tick >= bench.profile_start + BENCH_TICKS then
     local samples = remote.call("factorio_farming", "debug_profile_stop")
     bench.done = true
-    equal(snap.job.state, "completed", "benchmark lane did not complete during the reference run")
+    equal(snap.job.state, "completed", "benchmark field did not complete during the reference run")
     write_result("benchmark", {
       passed = true,
       profile_start_tick = bench.profile_start,
       profile_end_tick = event.tick,
       profiled_ticks = event.tick - bench.profile_start,
       samples = samples,
-      lane_completed_tick = bench.completed_tick,
+      field_completed_tick = bench.completed_tick,
       completed_area = snap.field.completed_area,
       total_area = snap.field.total_area
     })

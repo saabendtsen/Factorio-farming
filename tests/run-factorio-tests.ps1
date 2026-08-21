@@ -233,7 +233,7 @@ if ($SkipBenchmark) {
 
       Write-Host ("  profiled ticks      : {0} ({1:N1} s at 60 UPS)" -f $all.Count, ($all.Count / 60))
       Write-Host ("  active-job ticks    : {0}" -f $active.Count)
-      Write-Host ("  lane completed tick : {0}" -f $result.lane_completed_tick)
+      Write-Host ("  field completed tick: {0}" -f $result.field_completed_tick)
       Write-Host ("  whole run   average {0:N4} ms   p95 {1:N4} ms" -f $allAvg, $allP95)
       Write-Host ("  active work average {0:N4} ms   p95 {1:N4} ms" -f $activeAvg, $activeP95)
 
@@ -258,7 +258,7 @@ if ($SkipBenchmark) {
         active_p95_ms      = [Math]::Round($activeP95, 4)
         average_budget_ms  = $AverageBudgetMs
         p95_budget_ms      = $P95BudgetMs
-        lane_completed_tick = $result.lane_completed_tick
+        field_completed_tick = $result.field_completed_tick
       } | ConvertTo-Json | Out-File -FilePath (Join-Path $OutputRoot "performance.json") -Encoding ascii
     }
   }
