@@ -8,4 +8,6 @@ Both go/no-go spikes required before gameplay implementation are complete.
 
 The [first production vertical slice](first-production-vertical-slice.md) fixes the next implementation milestone: one selected field, one tractor, physical travel, one persistent and resumable lane, and a disposable progress projection.
 
+The [whole-field cultivation extension](whole-field-cultivation.md) records the next accepted production increment: four exact lanes, generated physical headland turns, full persistent coverage, and updated save/load and performance evidence.
+
 See the repository [task tracker](../../TASKS.md) for current scope and status.

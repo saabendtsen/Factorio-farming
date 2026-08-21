@@ -2,6 +2,8 @@
 
 Status: accepted; every acceptance gate below passes
 
+Historical scope: this document records the original one-lane proof. The accepted [whole-field cultivation extension](whole-field-cultivation.md) builds on it without rewriting the benchmark evidence below. That extension explicitly supersedes the centered `[6, 10)` lane geometry with a four-lane partition.
+
 Milestone: one field, one tractor, one cultivation lane
 
 ## Outcome

@@ -7,6 +7,11 @@ local load_recovery_needed = false
 local profile = nil
 local start_lane
 local complete_job
+local finish_lane
+
+local function copy_position(position)
+  return {x = position.x, y = position.y}
+end
 
 local transitions = {
   waiting = {reserved = true},
@@ -88,9 +93,15 @@ end
 
 local function lane_target(work_field)
   if work_field.axis == "x" then
-    return {x = work_field.direction == 1 and work_field.bounds.right or work_field.bounds.left, y = work_field.entrance.y}
+    return {
+      x = work_field.direction == 1 and work_field.bounds.right or work_field.bounds.left,
+      y = (work_field.lane.top + work_field.lane.bottom) / 2
+    }
   end
-  return {x = work_field.entrance.x, y = work_field.direction == 1 and work_field.bounds.bottom or work_field.bounds.top}
+  return {
+    x = (work_field.lane.left + work_field.lane.right) / 2,
+    y = work_field.direction == 1 and work_field.bounds.bottom or work_field.bounds.top
+  }
 end
 
 local function fail_job(state, reason, player)
@@ -126,7 +137,7 @@ local function reserve_job(state)
   if not job or not machine or job.state ~= "waiting" then return false end
   if not field_module.claim_lane(state.field, job.id, machine.id) then return false end
   job.machine_id = machine.id
-  job.lane_claim = 1
+  job.lane_claim = state.field.lane_index
   machine.job_id = job.id
   slice.transition(job, "reserved")
   return true
@@ -229,7 +240,7 @@ local function recover_loaded_state()
         elseif job.state == "working" then
           -- Re-derive lane motion from stored coverage, never from the saved
           -- controller position, so no uncovered tile is skipped.
-          start_lane(state)
+          start_lane(state, true)
         elseif job.state == "paused" or job.state == "failed" then
           -- Stay stopped. Only an explicit resume may restart work.
           machine.controller.state = "paused"
@@ -277,12 +288,21 @@ local function pause_state(state, player)
     return false
   end
   if job.state == "paused" then notify(player, "The farming job is already paused."); return true end
-  if job.state == "working" and machine.controller and machine.controller.work_position then
+  local controller = machine.controller or {}
+  job.paused_motion = {state = controller.state, purpose = controller.purpose}
+  if controller.purpose == "lane-start" then
+    job.paused_motion.remaining_waypoints = {}
+    for index = controller.waypoint_index or 1, #(controller.waypoints or {}) do
+      local waypoint = controller.waypoints[index].position or controller.waypoints[index]
+      job.paused_motion.remaining_waypoints[#job.paused_motion.remaining_waypoints + 1] = copy_position(waypoint)
+    end
+  end
+  if job.state == "working" and controller.state == "working" and controller.work_position then
     local entity = movement.entity(machine)
     if entity then
       local delta = field_module.commit(state.field,
         field_module.work_rectangle(state.field, machine.controller.work_position, entity.position, false))
-      machine.controller.work_position = {x = entity.position.x, y = entity.position.y}
+      controller.work_position = copy_position(entity.position)
       if delta > 0 then visuals.mark_dirty(state.field) end
     end
   end
@@ -316,19 +336,35 @@ local function resume_state(state, player)
     return false
   end
   job.machine_id = machine.id
-  job.lane_claim = 1
+  job.lane_claim = state.field.lane_index
   job.failure = nil
   job.generation = job.generation + 1
   machine.job_id = job.id
   machine.generation = machine.generation + 1
   machine.controller.recoveries = 0
-  local entity = movement.entity(machine)
-  if movement.distance(entity.position, state.field.entrance) <= 1 then
+  if job.paused_from == "working" then
     slice.transition(job, "working")
-    movement.begin_alignment(machine, lane_target(state.field))
+    local paused_motion = job.paused_motion or {}
+    if paused_motion.purpose == "lane-start" then
+      local next_position = field_module.next_uncovered(state.field)
+      if next_position then
+        local remaining = paused_motion.remaining_waypoints
+        movement.begin_lane_positioning(machine, next_position, remaining and #remaining > 0 and remaining or nil)
+      else
+        finish_lane(state)
+      end
+    elseif paused_motion.state == "aligning" then
+      movement.begin_alignment(machine, lane_target(state.field))
+    elseif paused_motion.state == "working" then
+      start_lane(state, true)
+    else
+      start_lane(state)
+    end
   else
     begin_travel(state)
   end
+  job.paused_from = nil
+  job.paused_motion = nil
   notify(player, "Farming job resumed.")
   return true
 end
@@ -337,16 +373,16 @@ function slice.resume(player)
   return resume_state(surface_state(player.surface.index), player)
 end
 
-start_lane = function(state)
+start_lane = function(state, resume_work)
   local next_position = field_module.next_uncovered(state.field)
   if not next_position then
-    complete_job(state)
+    finish_lane(state)
     return
   end
   local machine = state.machine
   local entity = movement.entity(machine)
-  if movement.distance(entity.position, next_position) <= 1 then
-    movement.begin_work(machine, lane_target(state.field))
+  if resume_work or movement.distance(entity.position, next_position) <= 1 then
+    movement.begin_work(machine, lane_target(state.field), next_position)
   else
     movement.begin_lane_positioning(machine, next_position)
   end
@@ -362,7 +398,29 @@ complete_job = function(state)
   job.lane_claim = nil
   machine.job_id = nil
   machine.controller.state = "idle"
-  game.print("[Factorio Farming] Lane complete: 256/1,024 tiles (25%).")
+  game.print("[Factorio Farming] Field complete: 1,024/1,024 tiles (100%).")
+end
+
+finish_lane = function(state)
+  local job = state.job
+  local machine = state.machine
+  field_module.release_lane(state.field, job.id)
+  job.lane_claim = nil
+
+  if not field_module.advance_lane(state.field) then
+    if state.field.completed_area == state.field.area then complete_job(state)
+    else fail_job(state, "Field stopped before exact completion.") end
+    return
+  end
+
+  if not field_module.claim_lane(state.field, job.id, machine.id) then
+    fail_job(state, "The next cultivation lane could not be claimed.")
+    return
+  end
+  job.lane_claim = state.field.lane_index
+  visuals.mark_dirty(state.field)
+  movement.begin_lane_positioning(machine, field_module.next_uncovered(state.field),
+    field_module.headland_waypoints(state.field))
 end
 
 local function handle_outcome(state, outcome)
@@ -385,7 +443,7 @@ local function handle_outcome(state, outcome)
   elseif outcome.type == "arrived" and outcome.purpose == "lane" and job.state == "working" then
     local delta = field_module.commit(state.field, field_module.work_rectangle(state.field, outcome.from, outcome.to, true))
     if delta > 0 then visuals.mark_dirty(state.field) end
-    if state.field.completed_area == state.field.lane_area then complete_job(state)
+    if field_module.next_uncovered(state.field) == nil then finish_lane(state)
     else fail_job(state, "Lane stopped before exact completion.") end
   end
 end
@@ -518,6 +576,8 @@ function slice.snapshot(surface_index)
       completed_area = work_field.completed_area,
       total_area = work_field.area,
       lane_area = work_field.lane_area,
+      lane_index = work_field.lane_index,
+      lane_count = #work_field.lanes,
       entrance = work_field.entrance,
       axis = work_field.axis,
       representation = work_field.representation

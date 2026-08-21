@@ -19,6 +19,18 @@ local function distance(a, b)
   return math.sqrt(dx * dx + dy * dy)
 end
 
+local function segment_reaches(from, to, target, radius)
+  if not from then return false end
+  local dx = to.x - from.x
+  local dy = to.y - from.y
+  local length_squared = dx * dx + dy * dy
+  if length_squared == 0 then return distance(to, target) <= radius end
+  local projection = ((target.x - from.x) * dx + (target.y - from.y) * dy) / length_squared
+  projection = math.max(0, math.min(1, projection))
+  local closest = {x = from.x + projection * dx, y = from.y + projection * dy}
+  return distance(closest, target) <= radius
+end
+
 local function entity_for(machine)
   if not machine or not machine.unit_number then return nil end
   local entity = game.get_entity_by_unit_number(machine.unit_number)
@@ -154,7 +166,7 @@ function movement.on_path_finished(event)
   return {type = "failed", machine_id = machine.id, reason = "No path to the field entrance."}
 end
 
-function movement.begin_work(machine, target)
+function movement.begin_work(machine, target, work_position)
   local entity = entity_for(machine)
   if not entity then return false end
   machine.controller = machine.controller or {}
@@ -163,22 +175,31 @@ function movement.begin_work(machine, target)
   machine.controller.goal = copy_position(target)
   machine.controller.waypoints = {{position = copy_position(target)}}
   machine.controller.waypoint_index = 1
-  machine.controller.work_position = copy_position(entity.position)
+  machine.controller.work_position = copy_position(work_position or entity.position)
   machine.controller.progress_position = copy_position(entity.position)
+  machine.controller.follow_position = copy_position(entity.position)
   machine.controller.progress_tick = game.tick
   return true
 end
 
-function movement.begin_lane_positioning(machine, target)
+function movement.begin_lane_positioning(machine, target, waypoints)
   local entity = entity_for(machine)
   if not entity then return false end
   machine.controller = machine.controller or {}
   machine.controller.state = "positioning"
   machine.controller.purpose = "lane-start"
   machine.controller.goal = copy_position(target)
-  machine.controller.waypoints = {{position = copy_position(target)}}
+  machine.controller.waypoints = {}
+  local positioning_waypoints = waypoints or {target}
+  for _, waypoint in ipairs(positioning_waypoints) do
+    machine.controller.waypoints[#machine.controller.waypoints + 1] = {
+      position = copy_position(waypoint),
+      radius = ARRIVAL_RADIUS
+    }
+  end
   machine.controller.waypoint_index = 1
   machine.controller.progress_position = copy_position(entity.position)
+  machine.controller.follow_position = copy_position(entity.position)
   machine.controller.progress_tick = game.tick
   return true
 end
@@ -191,6 +212,7 @@ function movement.begin_alignment(machine, target)
   machine.controller.purpose = "lane-align"
   machine.controller.goal = copy_position(target)
   machine.controller.progress_position = copy_position(entity.position)
+  machine.controller.follow_position = copy_position(entity.position)
   machine.controller.progress_tick = game.tick
   return true
 end
@@ -222,7 +244,9 @@ local function follow(machine, entity, tick)
     local remaining = distance(entity.position, target)
     local next_waypoint = controller.waypoints[controller.waypoint_index + 1]
     local passed = next_waypoint and distance(entity.position, next_waypoint.position or next_waypoint) + 0.1 < remaining
-    if remaining > ARRIVAL_RADIUS and not passed then break end
+    local arrival_radius = waypoint.radius or ARRIVAL_RADIUS
+    passed = passed or segment_reaches(controller.follow_position, entity.position, target, arrival_radius)
+    if remaining > arrival_radius and not passed then break end
     controller.waypoint_index = controller.waypoint_index + 1
     waypoint = controller.waypoints[controller.waypoint_index]
     if not waypoint then
@@ -260,8 +284,10 @@ local function follow(machine, entity, tick)
   if controller.purpose == "lane" then
     local previous = controller.work_position
     controller.work_position = copy_position(entity.position)
+    controller.follow_position = copy_position(entity.position)
     return {type = "progress", machine_id = machine.id, from = previous, to = copy_position(entity.position)}
   end
+  controller.follow_position = copy_position(entity.position)
   return nil
 end
 
@@ -305,7 +331,11 @@ function movement.update(machine, tick)
       if controller.purpose == "entrance" then
         movement.queue(machine, controller.goal, "entrance")
       elseif controller.purpose == "lane-start" then
-        movement.begin_lane_positioning(machine, controller.goal)
+        local remaining = {}
+        for index = controller.waypoint_index or 1, #(controller.waypoints or {}) do
+          remaining[#remaining + 1] = controller.waypoints[index].position or controller.waypoints[index]
+        end
+        movement.begin_lane_positioning(machine, controller.goal, #remaining > 0 and remaining or nil)
       elseif controller.purpose == "lane-align" then
         movement.begin_alignment(machine, controller.goal)
       else

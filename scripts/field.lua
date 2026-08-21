@@ -88,11 +88,20 @@ function field.create(id, surface_index, bounds, player_position)
     direction = -1
   end
 
-  local lane
-  if axis == "x" then
-    lane = {left = bounds.left, top = bounds.top + 6, right = bounds.right, bottom = bounds.top + 10}
-  else
-    lane = {left = bounds.left + 6, top = bounds.top, right = bounds.left + 10, bottom = bounds.bottom}
+  local lanes = {}
+  for lane_index = 1, EXPECTED_SHORT / WORK_WIDTH do
+    local offset = (lane_index - 1) * WORK_WIDTH
+    if axis == "x" then
+      lanes[lane_index] = {
+        left = bounds.left, top = bounds.top + offset,
+        right = bounds.right, bottom = bounds.top + offset + WORK_WIDTH
+      }
+    else
+      lanes[lane_index] = {
+        left = bounds.left + offset, top = bounds.top,
+        right = bounds.left + offset + WORK_WIDTH, bottom = bounds.bottom
+      }
+    end
   end
 
   local strips = {}
@@ -114,8 +123,11 @@ function field.create(id, surface_index, bounds, player_position)
     bounds = bounds,
     entrance = copy_position(entrance),
     axis = axis,
+    base_direction = direction,
     direction = direction,
-    lane = lane,
+    lanes = lanes,
+    lane_index = 1,
+    lane = lanes[1],
     area = EXPECTED_LONG * EXPECTED_SHORT,
     lane_area = EXPECTED_LONG * WORK_WIDTH,
     completed_area = 0,
@@ -123,6 +135,53 @@ function field.create(id, surface_index, bounds, player_position)
     chunk_representations = chunk_representations,
     strips = strips,
     generation = 1
+  }
+end
+
+function field.advance_lane(work_field)
+  local next_index = work_field.lane_index + 1
+  local next_lane = work_field.lanes[next_index]
+  if not next_lane then return false end
+  work_field.lane_index = next_index
+  work_field.lane = next_lane
+  work_field.direction = next_index % 2 == 1 and work_field.base_direction or -work_field.base_direction
+  work_field.generation = work_field.generation + 1
+  return true
+end
+
+function field.headland_waypoints(work_field)
+  if work_field.lane_index <= 1 then return {} end
+  local previous_lane = work_field.lanes[work_field.lane_index - 1]
+  local lane = work_field.lane
+  local previous_center
+  local next_center
+  local edge
+  local outward
+
+  if work_field.axis == "x" then
+    previous_center = (previous_lane.top + previous_lane.bottom) / 2
+    next_center = (lane.top + lane.bottom) / 2
+    edge = work_field.direction == -1 and work_field.bounds.right or work_field.bounds.left
+    outward = work_field.direction == -1 and 1 or -1
+    return {
+      {x = edge + outward * 2, y = previous_center},
+      {x = edge + outward * 3.5, y = previous_center + 1},
+      {x = edge + outward * 3.5, y = next_center - 1},
+      {x = edge + outward * 2, y = next_center},
+      {x = edge, y = next_center}
+    }
+  end
+
+  previous_center = (previous_lane.left + previous_lane.right) / 2
+  next_center = (lane.left + lane.right) / 2
+  edge = work_field.direction == -1 and work_field.bounds.bottom or work_field.bounds.top
+  outward = work_field.direction == -1 and 1 or -1
+  return {
+    {x = previous_center, y = edge + outward * 2},
+    {x = previous_center + 1, y = edge + outward * 3.5},
+    {x = next_center - 1, y = edge + outward * 3.5},
+    {x = next_center, y = edge + outward * 2},
+    {x = next_center, y = edge}
   }
 end
 
@@ -185,9 +244,9 @@ function field.next_uncovered(work_field)
   if (work_field.direction == 1 and cursor >= EXPECTED_LONG) or
      (work_field.direction == -1 and cursor <= 0) then return nil end
   if work_field.axis == "x" then
-    return {x = work_field.bounds.left + cursor, y = work_field.entrance.y}
+    return {x = work_field.bounds.left + cursor, y = (work_field.lane.top + work_field.lane.bottom) / 2}
   end
-  return {x = work_field.entrance.x, y = work_field.bounds.top + cursor}
+  return {x = (work_field.lane.left + work_field.lane.right) / 2, y = work_field.bounds.top + cursor}
 end
 
 function field.work_rectangle(work_field, from_position, to_position, final)
@@ -205,22 +264,39 @@ end
 
 function field.completed_rectangles(work_field)
   local rectangles = {}
-  local lane_strip_start = work_field.axis == "x" and
-    work_field.lane.top - work_field.bounds.top + 1 or
-    work_field.lane.left - work_field.bounds.left + 1
-  local ranges = work_field.strips[lane_strip_start]
-  for _, interval in ipairs(ranges) do
-    if work_field.axis == "x" then
-      rectangles[#rectangles + 1] = {
-        left = work_field.bounds.left + interval[1], top = work_field.lane.top,
-        right = work_field.bounds.left + interval[2], bottom = work_field.lane.bottom
-      }
-    else
-      rectangles[#rectangles + 1] = {
-        left = work_field.lane.left, top = work_field.bounds.top + interval[1],
-        right = work_field.lane.right, bottom = work_field.bounds.top + interval[2]
-      }
+  local function ranges_equal(first, second)
+    if #first ~= #second then return false end
+    for index, interval in ipairs(first) do
+      if interval[1] ~= second[index][1] or interval[2] ~= second[index][2] then return false end
     end
+    return true
+  end
+
+  local group_start = 1
+  while group_start <= #work_field.strips do
+    local ranges = work_field.strips[group_start]
+    local group_end = group_start
+    while group_end < #work_field.strips and ranges_equal(ranges, work_field.strips[group_end + 1]) do
+      group_end = group_end + 1
+    end
+    for _, interval in ipairs(ranges) do
+      if work_field.axis == "x" then
+        rectangles[#rectangles + 1] = {
+          left = work_field.bounds.left + interval[1],
+          top = work_field.bounds.top + group_start - 1,
+          right = work_field.bounds.left + interval[2],
+          bottom = work_field.bounds.top + group_end
+        }
+      else
+        rectangles[#rectangles + 1] = {
+          left = work_field.bounds.left + group_start - 1,
+          top = work_field.bounds.top + interval[1],
+          right = work_field.bounds.left + group_end,
+          bottom = work_field.bounds.top + interval[2]
+        }
+      end
+    end
+    group_start = group_end + 1
   end
   return rectangles
 end
@@ -230,7 +306,7 @@ function field.claim_lane(work_field, job_id, machine_id)
   if claim then
     return claim.job_id == job_id and claim.machine_id == machine_id
   end
-  work_field.lane_claim = {lane = 1, job_id = job_id, machine_id = machine_id}
+  work_field.lane_claim = {lane = work_field.lane_index, job_id = job_id, machine_id = machine_id}
   return true
 end
 
