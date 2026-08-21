@@ -1,6 +1,6 @@
 # First production vertical slice
 
-Status: implemented; full acceptance validation pending
+Status: accepted; every acceptance gate below passes
 
 Milestone: one field, one tractor, one cultivation lane
 
@@ -71,7 +71,7 @@ storage.farming
     visual_dirty          -- field IDs/ranges, never authoritative
 ```
 
-The job states are `waiting -> reserved -> travelling -> working -> completed`, with `reserved`, `travelling`, or `working` able to enter `paused` or `failed`. Resume returns `paused` to `travelling` or `working` after validating the entity, field, claim, and generations. A failed path/recovery stops visibly and retains progress; an explicit resume starts a fresh bounded attempt.
+The job states are `waiting -> reserved -> travelling -> working -> completed`, with `reserved`, `travelling`, or `working` able to enter `paused` or `failed`. `reserved` means the lane and tractor are claimed while no path request is in flight; travel begins on the following controller tick, so every state in the machine is observable and save-able for at least one tick rather than being a transient step inside setup. Resume returns `paused` to `travelling` or `working` after validating the entity, field, claim, and generations. A failed path/recovery stops visibly and retains progress; an explicit resume starts a fresh bounded attempt.
 
 Progress is represented as sorted, non-overlapping half-open intervals on canonical one-tile strips. A swept, field-clamped work rectangle is committed at most once per controller update. The field module returns the newly covered area; callers add no area themselves. `completed_area` must be monotonic and equal the union of stored coverage. Overlap therefore changes neither ranges nor counters.
 
@@ -132,6 +132,31 @@ The slice is accepted only when all of the following pass in a production mod, n
 - The completed job has no live claim or pending path request; the stopped tractor is unassigned; the field reports 256/1,024 tiles and 25%.
 - Automated pure-Lua tests cover geometry, interval union/overlap, counter deltas, deterministic lane/entrance selection, transition validity, and stale generations. A Factorio integration scenario covers the full flow and the save/load checkpoints.
 - `git diff --check`, the Lua/static checks available in the repository, the automated tests, and the five-minute performance run pass with their commands/results recorded in the implementation PR.
+
+## Validation results
+
+All gates run from `tests\run-factorio-tests.bat` against Factorio 2.1.14 (build 87180, win64) in four stages, entirely below `%LOCALAPPDATA%\FactorioFarmingProductionTests`.
+
+| Gate | Result |
+|---|---|
+| Pure-Lua geometry, interval, counter, transition tests | pass |
+| Acceptance flow, 25/50/75% interruptions, destruction/replacement, visual rebuild | pass, lane complete at tick 4,712 |
+| Save/load in `reserved` | pass, 0 tiles loaded, completed 256/1,024 in 955 ticks |
+| Save/load in `travelling` | pass, 0 tiles loaded, completed 256/1,024 in 956 ticks |
+| Save/load in `working` | pass, 64 tiles loaded, completed 256/1,024 in 497 ticks |
+| Save/load in `paused` | pass, stayed paused 60 ticks, completed 256/1,024 in 1,495 ticks |
+| Five-minute performance reference run | pass, see below |
+
+Save/load is exercised through real Factorio saves, not simulated. `game.auto_save` is ignored by `--benchmark`, so the harness drives one slice on a headless server with `auto_pause` disabled and saves it in each controller phase. Each phase save is then replayed with `--benchmark` and driven to exact completion. On load every phase discards its in-flight path request, increments machine and job generations so pre-save callbacks are stale, and rebuilds motion from stored coverage: `reserved` and `travelling` reissue a fresh path request, `working` re-derives lane motion from the first uncovered tile, and `paused` and `failed` stay stopped until an explicit resume.
+
+The profiler method is `helpers.create_profiler()` inside the mod's own `on_tick`, enabled only through the `debug_profile_start` remote. Each sample is stopped before it is logged, so logging never inflates it. The harness parses the samples from the run log and computes the average and the p95.
+
+| Window | Ticks | Average | p95 | Budget |
+|---|---:|---:|---:|---|
+| Whole five-minute run | 18,000 (300.0 s) | 0.0088 ms | 0.0131 ms | — |
+| Ticks with an active job | 945 | 0.0183 ms | 0.0597 ms | 0.25 ms average, 0.50 ms p95 |
+
+The active-job window is the gate, because the reference save contains one slice whose lane completes at tick 1,423 and the remaining run is idle. Both windows are well inside budget. No steering constant, tolerance, or budget needed tuning; the values ported from the spikes were kept unchanged. These remain slice regression gates, not fleet-scale claims.
 
 ## Executable implementation plan
 
