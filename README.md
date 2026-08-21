@@ -28,14 +28,16 @@ Whole-field cultivation implemented and accepted; every acceptance, save/load, a
 
 ## Next milestone
 
-Whole-field cultivation
+[Playable MVP wheat loop](https://github.com/saabendtsen/Factorio-farming/issues/16)
 
 Both go/no-go prototypes are complete:
 
 1. [Custom vehicle controller](docs/technical/spike-1-vehicle-controller-results.md): conditional GO through 300 active vehicles; production must rate-limit path requests.
 2. [Compressed field state and scalable visuals](docs/technical/spike-2-field-state-visuals-results.md): GO with ranges for coherent work, packed fragmented chunks, compressed render overlays, and bounded tile batches.
 
-The [first production vertical slice](docs/technical/first-production-vertical-slice.md) proved one persistent lane. The accepted [whole-field extension](docs/technical/whole-field-cultivation.md) now generates four non-overlapping lanes and three physical headland turns, completing exactly 1,024/1,024 tiles with one lane claim at a time. Save/load still recovers correctly in every controller phase, and the five-minute reference run remains inside its 0.25 ms average and 0.50 ms p95 budgets. Crops, economy, progression, multiple vehicle types, and polished UI remain postponed.
+The [first production vertical slice](docs/technical/first-production-vertical-slice.md) proved one persistent lane. The accepted [whole-field extension](docs/technical/whole-field-cultivation.md) now generates four non-overlapping lanes and three physical headland turns, completing exactly 1,024/1,024 tiles with one lane claim at a time. Save/load still recovers correctly in every controller phase, and the five-minute reference run remains inside its 0.25 ms average and 0.50 ms p95 budgets.
+
+The [Wayfinder map](https://github.com/saabendtsen/Factorio-farming/issues/16) carries the next milestone through implemented production code: one tractor cultivates, sows, grows, harvests, and stores deterministic wheat through a minimal real control seam. Multiple fields, fleets, economy, progression, circuits, AAI, and advanced agronomy are tracked there as seeds for later maps.
 
 Run the isolated Factorio 2.1 test harness with `tests\run-factorio-tests.bat`. It uses temporary mods, saves, and script output below `%LOCALAPPDATA%\FactorioFarmingProductionTests` and does not touch personal Factorio data. Four stages run in order:
 

@@ -2,9 +2,9 @@
 
 ## Active
 
-- [ ] **Define the second production vertical slice** - choose the next deliberately small end-to-end farming capability after whole-field cultivation.
-  - Produce one scoped technical specification with included/postponed behavior, acceptance criteria, module changes, and executable implementation tasks.
-  - Preserve the established controller, path, field-state, visualization, and performance boundaries unless new evidence justifies a documented change.
+- [ ] **Build the playable MVP wheat loop** - follow the [Wayfinder map](https://github.com/saabendtsen/Factorio-farming/issues/16) through cultivate, sow, grow, harvest, and stored wheat.
+  - The map is canonical for decisions, dependencies, the active frontier, and implementation work through merged production code.
+  - Future phases remain visible as fresh-map seeds in the map's Out of scope section.
 
 ## Waiting On
 
@@ -14,6 +14,10 @@
 - [ ] **Prototype circuit-network integration**
 
 ## Done
+
+- [x] ~~Define the second production vertical slice~~ (2026-08-21)
+  - Reframed the next milestone as an execution-inclusive Wayfinder map for the complete playable MVP wheat loop.
+  - Fixed the destination to one field, one tractor with logical implements, persisted visible growth, deterministic wheat, one storage container, and a minimal real control seam.
 
 - [x] ~~Cultivate the whole field~~ (2026-08-21)
   - Generated four non-overlapping lanes and three physical U-turns from field geometry, alternating direction while holding exactly one lane claim.
