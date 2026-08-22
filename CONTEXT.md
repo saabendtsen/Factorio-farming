@@ -24,6 +24,10 @@ _Avoid_: Farming lifecycle, production recipe
 A visible maturity state of a crop between sowing and harvest readiness.
 _Avoid_: Growth level, phase
 
+**Crop record**:
+The persisted sowing-coverage range whose sow tick and generation determine its derived growth stage.
+_Avoid_: Crop entity, field-wide crop
+
 **Implement**:
 The equipment or capability that enables a tractor to perform a particular field operation.
 _Avoid_: Tool, attachment
