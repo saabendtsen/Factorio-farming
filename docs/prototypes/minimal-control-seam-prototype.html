@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — Minimal farming control seam</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#151916; color:#ece8d8; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; background:linear-gradient(145deg,#263023,#151916 56%); }
+    .prototype-note { padding:10px 18px; background:#543d12; color:#fff2bc; font-size:14px; text-align:center; }
+    main { max-width:1100px; margin:auto; padding:44px 28px 110px; } h1 { margin:0 0 8px; } .muted { color:#b6b9a8; }
+    .field { position:relative; margin:28px 0; min-height:290px; border:8px solid #65512d; background:repeating-linear-gradient(0deg,#6e5128 0 25px,#755c31 26px 50px); overflow:hidden; }
+    .rows { position:absolute; inset:0; background:repeating-linear-gradient(90deg,transparent 0 66px,rgba(246,218,112,.18) 67px 69px); }
+    .tractor { position:absolute; left:43%; top:44%; font-size:48px; filter:drop-shadow(0 4px 2px #111); } .crop { position:absolute; right:14%; top:36%; font-size:46px; }
+    button { font:inherit; cursor:pointer; border:0; border-radius:6px; padding:10px 14px; font-weight:700; background:#d6ad42; color:#171307; } button.secondary { background:#3a4439; color:#eef2e9; } button.danger { background:#914236; color:#fff; }
+    .panel { background:#242a24; border:1px solid #596354; box-shadow:0 12px 30px #0005; } .panel h2,.panel h3 { margin-top:0; }
+    .status { display:grid; gap:12px; grid-template-columns:repeat(3,1fr); padding:18px; } .metric { background:#1a201b; padding:14px; border-left:4px solid #d6ad42; } .metric b { display:block; font-size:22px; }
+    .variant-a .action { position:absolute; bottom:18px; left:18px; padding:17px; max-width:360px; } .variant-a .action p { margin:7px 0 13px; }
+    .variant-b { display:grid; grid-template-columns:300px 1fr; gap:16px; } .variant-b .sidebar { padding:20px; } .variant-b .step { padding:13px 0; border-bottom:1px solid #465045; } .variant-b .step.active { color:#ffd66d; font-weight:700; } .variant-b .field { margin:0; }
+    .variant-c { display:grid; grid-template-columns:1fr 340px; gap:16px; } .variant-c .field { margin:0; } .variant-c .console { padding:20px; } .event { margin:14px 0; padding-bottom:14px; border-bottom:1px solid #465045; } .event small { color:#aeb8a5; }
+    .controls { display:flex; flex-wrap:wrap; gap:9px; margin-top:18px; }
+    .switcher { position:fixed; z-index:2; bottom:20px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:12px; background:#f3f0e5; color:#171a15; padding:8px; border-radius:999px; box-shadow:0 5px 26px #0008; } .switcher button { padding:7px 11px; background:#182019; color:#fff; } .switcher strong { min-width:172px; text-align:center; }
+    @media(max-width:720px){ main{padding:25px 14px 100px}.status,.variant-b,.variant-c{grid-template-columns:1fr}.field{min-height:240px}.variant-b .field{min-height:240px} }
+  </style>
+</head>
+<body>
+  <!-- THROWAWAY PROTOTYPE: three minimal Factorio control-seam variants, switchable with ?variant=A|B|C. -->
+  <div class="prototype-note">PROTOTYPE — not Factorio UI, not production code. Use this to choose an interaction shape.</div>
+  <main id="app"></main>
+  <nav class="switcher" aria-label="Prototype variant switcher"><button id="previous" aria-label="Previous variant">←</button><strong id="label"></strong><button id="next" aria-label="Next variant">→</button></nav>
+  <script>
+    const variants = {
+      A: { name: 'Contextual field action', markup: `
+        <h1>Selected field</h1><p class="muted">The player selects the field; its next useful action appears where the work is happening.</p>
+        <section class="field variant-a"><div class="rows"></div><span class="tractor">🚜</span><span class="crop">🌱</span><article class="panel action"><h2>North wheat field</h2><p>Prepared · 1,024 tiles · tractor idle</p><button data-action="Start sowing">Start sowing</button></article></section>
+        <section class="panel status"><div class="metric"><span>Next field operation</span><b>Sow wheat</b></div><div class="metric"><span>Storage container</span><b>Iron chest · ready</b></div><div class="metric"><span>Tractor</span><b>Idle nearby</b></div></section>` },
+      B: { name: 'Operation checklist', markup: `
+        <h1>Farming job</h1><p class="muted">The field is a short, explicit workflow. The player sees where the crop cycle is and starts only the next field operation.</p>
+        <section class="variant-b"><aside class="panel sidebar"><h2>North wheat field</h2><div class="step">✓ Cultivate</div><div class="step active">2 · Sow wheat</div><div class="step">3 · Growing</div><div class="step">4 · Harvest and store</div><div class="controls"><button data-action="Start sowing">Start sowing</button><button class="secondary" data-action="Show field">Show field</button></div></aside><div class="field"><div class="rows"></div><span class="tractor">🚜</span><span class="crop">🌱</span></div></section>
+        <section class="panel status"><div class="metric"><span>Tractor</span><b>Idle</b></div><div class="metric"><span>Storage container</span><b>Ready</b></div><div class="metric"><span>Crop cycle</span><b>1 of 4</b></div></section>` },
+      C: { name: 'Tractor command panel', markup: `
+        <h1>Farming tractor</h1><p class="muted">The player selects the tractor, then assigns it to the selected field. Status follows the machine.</p>
+        <section class="variant-c"><div class="field"><div class="rows"></div><span class="tractor">🚜</span><span class="crop">🌱</span></div><aside class="panel console"><h2>Tractor #1</h2><p><b>Idle</b><br><span class="muted">Beside North wheat field</span></p><div class="controls"><button data-action="Assign sowing">Assign sowing</button><button class="secondary" data-action="Locate field">Locate field</button></div><div class="event"><small>FIELD</small><br>North wheat field · prepared</div><div class="event"><small>STORAGE</small><br>Iron chest · 0 / 48 wheat</div><div class="event"><small>NEXT</small><br>Sow wheat across 1,024 tiles</div></aside></section>` }
+    };
+    const keys = Object.keys(variants);
+    const getKey = () => new URLSearchParams(location.search).get('variant')?.toUpperCase() || 'A';
+    function render() { const key = variants[getKey()] ? getKey() : 'A'; document.getElementById('app').innerHTML = variants[key].markup; document.getElementById('label').textContent = `${key} — ${variants[key].name}`; document.querySelectorAll('[data-action]').forEach(button => button.onclick=()=>alert(`${button.dataset.action} is the proposed real control. This prototype makes no change.`)); }
+    function move(delta) { const next = keys[(keys.indexOf(getKey()) + delta + keys.length) % keys.length]; const url = new URL(location); url.searchParams.set('variant', next); history.replaceState({}, '', url); render(); }
+    document.getElementById('previous').onclick=()=>move(-1); document.getElementById('next').onclick=()=>move(1);
+    document.addEventListener('keydown', event => { if (!['INPUT','TEXTAREA'].includes(document.activeElement.tagName) && !document.activeElement.isContentEditable) { if(event.key==='ArrowLeft') move(-1); if(event.key==='ArrowRight') move(1); }}); render();
+  </script>
+</body>
+</html>
