@@ -35,7 +35,7 @@ end
 local function ensure_root()
   storage.farming = storage.farming or {}
   local root = storage.farming
-  root.schema_version = root.schema_version or 1
+  if root.schema_version ~= 2 then field_module.migrate_storage(root) end
   root.next_field_id = root.next_field_id or 1
   root.next_machine_id = root.next_machine_id or 1
   root.next_job_id = root.next_job_id or 1
@@ -194,7 +194,7 @@ end
 function slice.on_configuration_changed()
   local root = ensure_root()
   for _, state in pairs(root.surfaces) do
-    if state.field then visuals.mark_dirty(state.field) end
+    if state.field and not state.field.migration_failed then visuals.mark_dirty(state.field) end
   end
 end
 
@@ -322,6 +322,10 @@ end
 local function resume_state(state, player)
   local job = state.job
   local machine = state.machine
+  if state.field and state.field.migration_failed then
+    notify(player, "This field migration failed and cannot be resumed.")
+    return false
+  end
   if not job or (job.state ~= "paused" and job.state ~= "failed") then
     notify(player, job and "The farming job is already active." or "There is no farming job to resume.")
     return false
