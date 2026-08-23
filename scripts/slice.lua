@@ -8,6 +8,11 @@ local profile = nil
 local start_lane
 local complete_job
 local finish_lane
+local commit_work
+local start_next_operation
+
+local WHEAT_ITEM = "farming-wheat"
+local STORAGE_RADIUS = 32
 
 local function copy_position(position)
   return {x = position.x, y = position.y}
@@ -80,6 +85,11 @@ local function create_machine(surface, force, position)
     unit_number = entity.unit_number,
     generation = 1,
     capability = {work_width = 4},
+    implements = {
+      cultivation = {work_width = 4},
+      sowing = {work_width = 4},
+      harvesting = {work_width = 4}
+    },
     job_id = nil,
     last_position = {x = entity.position.x, y = entity.position.y},
     controller = {state = "idle", recoveries = 0}
@@ -174,7 +184,8 @@ local function create_field_job(surface_index, bounds, player_position)
     id = root.next_job_id,
     field_id = work_field.id,
     machine_id = nil,
-    state = "waiting",
+    state = "completed",
+    operation = nil,
     lane_claim = nil,
     generation = 1,
     failure = nil
@@ -182,7 +193,6 @@ local function create_field_job(surface_index, bounds, player_position)
   root.next_job_id = root.next_job_id + 1
   state.field = work_field
   state.job = job
-  reserve_job(state)
   visuals.mark_dirty(work_field)
   return work_field
 end
@@ -196,6 +206,77 @@ function slice.on_configuration_changed()
   for _, state in pairs(root.surfaces) do
     if state.field and not state.field.migration_failed then visuals.mark_dirty(state.field) end
   end
+end
+
+local function distance_squared(first, second)
+  local x = first.x - second.x
+  local y = first.y - second.y
+  return x * x + y * y
+end
+
+local function destination_inventory(state)
+  local field = state.field
+  local entity = field and field.storage_unit_number and game.get_entity_by_unit_number(field.storage_unit_number)
+  if (not entity or not entity.valid) and field and field.storage_position then
+    local surface = game.get_surface(field.surface_index)
+    local nearby = surface.find_entities_filtered({type = "container", position = field.storage_position, radius = 0.1})
+    entity = nearby[1]
+  end
+  if entity and entity.valid then
+    local inventory = entity.get_inventory(defines.inventory.chest) or entity.get_inventory(1)
+    if inventory then return inventory, entity end
+  end
+  return nil
+end
+
+local function designate_storage(state)
+  local work_field = state.field
+  local surface = game.get_surface(work_field.surface_index)
+  local candidates = surface.find_entities_filtered({type = "container", position = work_field.entrance, radius = STORAGE_RADIUS})
+  table.sort(candidates, function(first, second)
+    local first_distance = distance_squared(first.position, work_field.entrance)
+    local second_distance = distance_squared(second.position, work_field.entrance)
+    if first_distance ~= second_distance then return first_distance < second_distance end
+    return first.unit_number < second.unit_number
+  end)
+  local container = candidates[1]
+  if not container then return false, "Place a storage container within 32 tiles of the field entrance before harvesting." end
+  work_field.storage_unit_number = container.unit_number
+  work_field.storage_position = copy_position(container.position)
+  return true
+end
+
+commit_work = function(state, rectangle)
+  local job = state.job
+  local operation_name = job.operation
+  if operation_name ~= "harvesting" then
+    local delta = field_module.commit_operation(state.field, operation_name, rectangle, game.tick)
+    if operation_name == "sowing" and delta > 0 then
+      state.field.next_growth_visual_tick = field_module.next_growth_tick(state.field, game.tick)
+    end
+    return delta
+  end
+  local inventory = destination_inventory(state)
+  if not inventory then
+    job.restart_from_work = true
+    fail_job(state, "The designated storage container is missing or invalid. Ready wheat has been preserved.")
+    return 0
+  end
+  local requested = field_module.rectangle_area(state.field, rectangle)
+  if requested <= 0 then return 0 end
+  if not field_module.operation_rectangle_is_uncovered(state.field, operation_name, rectangle) then return 0 end
+  if not inventory.can_insert({name = WHEAT_ITEM, count = requested}) then
+    job.restart_from_work = true
+    fail_job(state, "The designated storage container cannot accept more wheat. Ready crops have been preserved.")
+    return 0
+  end
+  local inserted = inventory.insert({name = WHEAT_ITEM, count = requested})
+  if inserted ~= requested then
+    job.restart_from_work = true
+    fail_job(state, "Wheat transfer was incomplete. Ready crops have been preserved.")
+    return 0
+  end
+  return field_module.commit_operation(state.field, operation_name, rectangle, game.tick, inserted)
 end
 
 function slice.on_load()
@@ -277,7 +358,9 @@ function slice.on_selected_area(event)
   if not bounds then notify(player, error_message); return end
   local work_field, create_error = create_field_job(event.surface.index, bounds, player.position)
   if not work_field then notify(player, create_error); return end
-  notify(player, "Field accepted. Tractor travelling to its entrance.")
+  surface_state(event.surface.index).job.player_index = event.player_index
+  notify(player, "Field accepted. Use the contextual field action to start cultivation.")
+  slice.show_contextual_action(player)
 end
 
 local function pause_state(state, player)
@@ -300,7 +383,7 @@ local function pause_state(state, player)
   if job.state == "working" and controller.state == "working" and controller.work_position then
     local entity = movement.entity(machine)
     if entity then
-      local delta = field_module.commit(state.field,
+      local delta = commit_work(state,
         field_module.work_rectangle(state.field, machine.controller.work_position, entity.position, false))
       controller.work_position = copy_position(entity.position)
       if delta > 0 then visuals.mark_dirty(state.field) end
@@ -336,7 +419,7 @@ local function resume_state(state, player)
   end
 
   if not field_module.claim_lane(state.field, job.id, machine.id) then
-    notify(player, "The cultivation lane is already claimed.")
+    notify(player, "The current field-operation lane is already claimed.")
     return false
   end
   job.machine_id = machine.id
@@ -346,11 +429,11 @@ local function resume_state(state, player)
   machine.job_id = job.id
   machine.generation = machine.generation + 1
   machine.controller.recoveries = 0
-  if job.paused_from == "working" then
+  if job.paused_from == "working" or job.restart_from_work then
     slice.transition(job, "working")
     local paused_motion = job.paused_motion or {}
     if paused_motion.purpose == "lane-start" then
-      local next_position = field_module.next_uncovered(state.field)
+      local next_position = field_module.next_uncovered_for(state.field, job.operation)
       if next_position then
         local remaining = paused_motion.remaining_waypoints
         movement.begin_lane_positioning(machine, next_position, remaining and #remaining > 0 and remaining or nil)
@@ -368,6 +451,7 @@ local function resume_state(state, player)
     begin_travel(state)
   end
   job.paused_from = nil
+  job.restart_from_work = nil
   job.paused_motion = nil
   notify(player, "Farming job resumed.")
   return true
@@ -377,8 +461,70 @@ function slice.resume(player)
   return resume_state(surface_state(player.surface.index), player)
 end
 
+start_next_operation = function(state, player)
+  local job = state.job
+  local machine = state.machine
+  if not job or job.state ~= "completed" then
+    notify(player, "The field already has an active operation.")
+    return false
+  end
+  if not machine or not movement.entity(machine) then
+    notify(player, "Create a replacement tractor with /farming-slice-setup first.")
+    return false
+  end
+  local operation_name = field_module.next_operation(state.field, game.tick)
+  if not operation_name then
+    notify(player, "Crops are still growing; no field operation is ready.")
+    return false
+  end
+  if operation_name == "harvesting" then
+    local designated, message = designate_storage(state)
+    if not designated then notify(player, message); return false end
+  end
+  field_module.begin_operation(state.field)
+  job.operation = operation_name
+  job.state = "waiting"
+  job.failure = nil
+  job.generation = job.generation + 1
+  if not reserve_job(state) then
+    fail_job(state, "The field-operation lane could not be claimed.", player)
+    return false
+  end
+  notify(player, "Tractor starting " .. operation_name .. ".")
+  return true
+end
+
+function slice.show_contextual_action(player)
+  local gui = player.gui.left
+  local existing = gui.farming_field_action
+  if existing then existing.destroy() end
+  local state = surface_state(player.surface.index)
+  if not state.field or not state.job then return end
+  local lifecycle = field_module.lifecycle(state.field, game.tick)
+  local frame = gui.add({type = "frame", name = "farming_field_action", direction = "vertical", caption = "Farming field"})
+  frame.add({type = "label", caption = "Status: " .. lifecycle})
+  local operation_name = field_module.next_operation(state.field, game.tick)
+  if state.job.state == "completed" and operation_name then
+    frame.add({type = "button", name = "farming_field_primary_action", caption = "Start " .. operation_name})
+  elseif state.job.state == "completed" then
+    frame.add({type = "label", caption = "Crops are growing"})
+  else
+    frame.add({type = "label", caption = "Tractor: " .. state.job.operation .. " (" .. state.job.state .. ")"})
+  end
+end
+
+function slice.on_gui_click(event)
+  if event.element and event.element.valid and event.element.name == "farming_field_primary_action" then
+    local player = game.get_player(event.player_index)
+    if player then
+      start_next_operation(surface_state(player.surface.index), player)
+      slice.show_contextual_action(player)
+    end
+  end
+end
+
 start_lane = function(state, resume_work)
-  local next_position = field_module.next_uncovered(state.field)
+  local next_position = field_module.next_uncovered_for(state.field, state.job.operation)
   if not next_position then
     finish_lane(state)
     return
@@ -402,7 +548,9 @@ complete_job = function(state)
   job.lane_claim = nil
   machine.job_id = nil
   machine.controller.state = "idle"
-  game.print("[Factorio Farming] Field complete: 1,024/1,024 tiles (100%).")
+  game.print({"", "[Factorio Farming] ", job.operation, " complete. Select the field to start its next operation."})
+  local player = job.player_index and game.get_player(job.player_index)
+  if player then slice.show_contextual_action(player) end
 end
 
 finish_lane = function(state)
@@ -412,18 +560,18 @@ finish_lane = function(state)
   job.lane_claim = nil
 
   if not field_module.advance_lane(state.field) then
-    if state.field.completed_area == state.field.area then complete_job(state)
-    else fail_job(state, "Field stopped before exact completion.") end
+    if field_module.next_uncovered_for(state.field, job.operation) == nil then complete_job(state)
+    else fail_job(state, "Field operation stopped before exact completion.") end
     return
   end
 
   if not field_module.claim_lane(state.field, job.id, machine.id) then
-    fail_job(state, "The next cultivation lane could not be claimed.")
+    fail_job(state, "The next field-operation lane could not be claimed.")
     return
   end
   job.lane_claim = state.field.lane_index
   visuals.mark_dirty(state.field)
-  movement.begin_lane_positioning(machine, field_module.next_uncovered(state.field),
+  movement.begin_lane_positioning(machine, field_module.next_uncovered_for(state.field, job.operation),
     field_module.headland_waypoints(state.field))
 end
 
@@ -440,15 +588,45 @@ local function handle_outcome(state, outcome)
   elseif outcome.type == "aligned" and job.state == "working" then
     start_lane(state)
   elseif outcome.type == "arrived" and outcome.purpose == "lane-start" and job.state == "working" then
-    movement.begin_work(machine, lane_target(state.field))
+    movement.begin_work(machine, lane_target(state.field), field_module.next_uncovered_for(state.field, job.operation))
   elseif outcome.type == "progress" and job.state == "working" then
-    local delta = field_module.commit(state.field, field_module.work_rectangle(state.field, outcome.from, outcome.to, false))
+    local rectangle = job.operation == "harvesting" and
+      field_module.next_uncovered_rectangle(state.field, job.operation) or
+      field_module.work_rectangle(state.field, outcome.from, outcome.to, false)
+    local delta = rectangle and commit_work(state, rectangle) or 0
     if delta > 0 then visuals.mark_dirty(state.field) end
   elseif outcome.type == "arrived" and outcome.purpose == "lane" and job.state == "working" then
-    local delta = field_module.commit(state.field, field_module.work_rectangle(state.field, outcome.from, outcome.to, true))
+    local rectangle = job.operation == "harvesting" and
+      field_module.next_uncovered_rectangle(state.field, job.operation) or
+      field_module.work_rectangle(state.field, outcome.from, outcome.to, true)
+    local delta = commit_work(state, rectangle)
     if delta > 0 then visuals.mark_dirty(state.field) end
-    if field_module.next_uncovered(state.field) == nil then finish_lane(state)
-    else fail_job(state, "Lane stopped before exact completion.") end
+    -- Physical arrival can leave the final sub-tile rectangle behind the
+    -- arrival radius. Commit only authoritative first-uncovered rectangles
+    -- until that lane is exact; never sweep over already harvested coverage.
+    while job.operation == "harvesting" and job.state == "working" do
+      local remaining = field_module.next_uncovered_rectangle(state.field, job.operation)
+      if not remaining then break end
+      local remaining_delta = commit_work(state, remaining)
+      if remaining_delta <= 0 then break end
+      visuals.mark_dirty(state.field)
+    end
+    if field_module.next_uncovered_for(state.field, job.operation) == nil then finish_lane(state)
+    else start_lane(state, true) end
+  end
+end
+
+local function finish_arrived_harvest_lane(state)
+  local job = state.job
+  if not job or job.state ~= "working" or job.operation ~= "harvesting" then return end
+  local machine = state.machine
+  local entity = machine and movement.entity(machine)
+  if not entity or movement.distance(entity.position, lane_target(state.field)) > 1 then return end
+  while job.state == "working" do
+    local rectangle = field_module.next_uncovered_rectangle(state.field, job.operation)
+    if not rectangle then finish_lane(state); return end
+    if commit_work(state, rectangle) <= 0 then return end
+    visuals.mark_dirty(state.field)
   end
 end
 
@@ -472,6 +650,10 @@ local function tick_body(event)
   local active = 0
   for _, index in ipairs(surface_indexes) do
     local state = root.surfaces[index]
+    if state.field and state.field.next_growth_visual_tick and event.tick >= state.field.next_growth_visual_tick then
+      visuals.mark_dirty(state.field)
+      state.field.next_growth_visual_tick = field_module.next_growth_tick(state.field, event.tick)
+    end
     if state.machine and state.job and state.job.state ~= "paused" and state.job.state ~= "failed" and state.job.state ~= "completed" then
       active = active + 1
       if (event.tick + state.machine.id) % movement.constants.cadence == 0 then
@@ -490,6 +672,10 @@ local function tick_body(event)
     end
     root.last_controller_machine_id = selected.machine.id
     handle_outcome(selected, movement.update(selected.machine, event.tick))
+    finish_arrived_harvest_lane(selected)
+  end
+  for _, index in ipairs(surface_indexes) do
+    finish_arrived_harvest_lane(root.surfaces[index])
   end
   visuals.update()
   return active
@@ -543,7 +729,11 @@ function slice.debug_setup(surface_index, bounds, tractor_position)
   if not normalized then return false, normalize_error end
   local work_field, field_error = create_field_job(surface_index, normalized, tractor_position)
   if not work_field then return false, field_error end
-  return true
+  return start_next_operation(surface_state(surface_index))
+end
+
+function slice.debug_start_next_operation(surface_index)
+  return start_next_operation(surface_state(surface_index))
 end
 
 function slice.debug_pause(surface_index)
@@ -584,11 +774,18 @@ function slice.snapshot(surface_index)
       lane_count = #work_field.lanes,
       entrance = work_field.entrance,
       axis = work_field.axis,
-      representation = work_field.representation
+      representation = work_field.representation,
+      cultivated_area = field_module.operation_area(work_field, "cultivation"),
+      sown_area = field_module.operation_area(work_field, "sowing"),
+      harvested_area = field_module.operation_area(work_field, "harvesting"),
+      lifecycle = field_module.lifecycle(work_field, game.tick),
+      crop_count = #work_field.crops,
+      direction = work_field.direction
     } or nil,
     job = job and {
       id = job.id,
       state = job.state,
+      operation = job.operation,
       machine_id = job.machine_id,
       has_claim = job.lane_claim ~= nil,
       generation = job.generation,
@@ -601,6 +798,7 @@ function slice.snapshot(surface_index)
       job_id = machine.job_id,
       generation = machine.generation,
       controller_state = machine.controller.state,
+      controller_goal = machine.controller.goal,
       recoveries = machine.controller.recoveries,
       position = movement.entity(machine) and {
         x = movement.entity(machine).position.x,

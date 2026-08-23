@@ -277,6 +277,20 @@ local function clipped_rectangle(work_field, rectangle)
   return clipped
 end
 
+function field.rectangle_area(work_field, rectangle)
+  local clipped = clipped_rectangle(work_field, rectangle)
+  if not clipped then return 0 end
+  return (clipped.right - clipped.left) * (clipped.bottom - clipped.top)
+end
+
+function field.begin_operation(work_field)
+  work_field.lane_index = 1
+  work_field.lane = work_field.lanes[1]
+  work_field.direction = work_field.base_direction
+  work_field.lane_claim = nil
+  work_field.generation = work_field.generation + 1
+end
+
 local function local_range(work_field, strip_index, clipped)
   if work_field.axis == "x" then
     return clipped.left - work_field.bounds.left, clipped.right - work_field.bounds.left
@@ -346,6 +360,23 @@ local function rectangle_is_covered(work_field, target, clipped)
   return valid
 end
 
+local function rectangle_is_uncovered(work_field, target, clipped)
+  local uncovered = true
+  each_strip(work_field, clipped, function(strip_index)
+    local first, last = local_range(work_field, strip_index, clipped)
+    for _, interval in ipairs(target.strips[strip_index]) do
+      if interval[1] < last and first < interval[2] then uncovered = false; return end
+    end
+  end)
+  return uncovered
+end
+
+function field.operation_rectangle_is_uncovered(work_field, operation_name, rectangle)
+  local target = operation(work_field, operation_name)
+  local clipped = clipped_rectangle(work_field, rectangle)
+  return target ~= nil and clipped ~= nil and rectangle_is_uncovered(work_field, target, clipped)
+end
+
 local function add_crop_record(work_field, strips, sow_tick)
   local area = strips_area(strips)
   if area == 0 then return end
@@ -388,6 +419,23 @@ local function ready_crop_coverage(work_field, tick)
     end
   end
   return ready
+end
+
+function field.crop_stage(crop, tick)
+  local elapsed = math.max(0, (tick or 0) - crop.sow_tick)
+  if elapsed >= GROWTH_TICKS then return "ready" end
+  if elapsed >= GROWTH_TICKS / 2 then return "growing" end
+  return "sown"
+end
+
+function field.next_growth_tick(work_field, tick)
+  local next_tick = nil
+  for _, crop in ipairs(work_field.crops) do
+    local midpoint = crop.sow_tick + GROWTH_TICKS / 2
+    if midpoint > tick and (not next_tick or midpoint < next_tick) then next_tick = midpoint end
+    if crop.ready_tick > tick and (not next_tick or crop.ready_tick < next_tick) then next_tick = crop.ready_tick end
+  end
+  return next_tick
 end
 
 function field.commit_operation(work_field, name, rectangle, tick, transferred_area)
@@ -438,10 +486,24 @@ function field.lifecycle(work_field, tick)
   return "ready"
 end
 
-function field.next_uncovered(work_field)
+function field.next_operation(work_field, tick)
+  local cultivated = field.operation_area(work_field, "cultivation")
+  local sown = field.operation_area(work_field, "sowing")
+  if cultivated < work_field.area then return "cultivation" end
+  if sown < cultivated then return "sowing" end
+  if sown == 0 then return "sowing" end
+  for _, crop in ipairs(work_field.crops) do
+    if field.crop_stage(crop, tick) ~= "ready" then return nil end
+  end
+  return "harvesting"
+end
+
+function field.next_uncovered_for(work_field, operation_name)
+  local target = operation(work_field, operation_name or "cultivation")
+  if not target then return nil end
   local representative = work_field.axis == "x" and
-    work_field.strips[work_field.lane.top - work_field.bounds.top + 1] or
-    work_field.strips[work_field.lane.left - work_field.bounds.left + 1]
+    target.strips[work_field.lane.top - work_field.bounds.top + 1] or
+    target.strips[work_field.lane.left - work_field.bounds.left + 1]
   local cursor = work_field.direction == 1 and 0 or EXPECTED_LONG
 
   if work_field.direction == 1 then
@@ -465,6 +527,10 @@ function field.next_uncovered(work_field)
   return {x = (work_field.lane.left + work_field.lane.right) / 2, y = work_field.bounds.top + cursor}
 end
 
+function field.next_uncovered(work_field)
+  return field.next_uncovered_for(work_field, "cultivation")
+end
+
 function field.work_rectangle(work_field, from_position, to_position, final)
   if work_field.axis == "x" then
     local first = math.min(from_position.x, to_position.x)
@@ -478,7 +544,7 @@ function field.work_rectangle(work_field, from_position, to_position, final)
   return {left = work_field.lane.left, top = first, right = work_field.lane.right, bottom = last}
 end
 
-function field.completed_rectangles(work_field)
+local function rectangles_for_strips(work_field, strips)
   local rectangles = {}
   local function ranges_equal(first, second)
     if #first ~= #second then return false end
@@ -489,10 +555,10 @@ function field.completed_rectangles(work_field)
   end
 
   local group_start = 1
-  while group_start <= #work_field.strips do
-    local ranges = work_field.strips[group_start]
+  while group_start <= #strips do
+    local ranges = strips[group_start]
     local group_end = group_start
-    while group_end < #work_field.strips and ranges_equal(ranges, work_field.strips[group_end + 1]) do
+    while group_end < #strips and ranges_equal(ranges, strips[group_end + 1]) do
       group_end = group_end + 1
     end
     for _, interval in ipairs(ranges) do
@@ -515,6 +581,30 @@ function field.completed_rectangles(work_field)
     group_start = group_end + 1
   end
   return rectangles
+end
+
+function field.next_uncovered_rectangle(work_field, operation_name)
+  local position = field.next_uncovered_for(work_field, operation_name)
+  if not position then return nil end
+  if work_field.axis == "x" then
+    local left = work_field.direction == -1 and position.x - 1 or position.x
+    return {left = left, top = work_field.lane.top, right = left + 1, bottom = work_field.lane.bottom}
+  end
+  local top = work_field.direction == -1 and position.y - 1 or position.y
+  return {left = work_field.lane.left, top = top, right = work_field.lane.right, bottom = top + 1}
+end
+
+function field.operation_rectangles(work_field, operation_name)
+  local target = operation(work_field, operation_name)
+  return target and rectangles_for_strips(work_field, target.strips) or {}
+end
+
+function field.crop_rectangles(work_field, crop)
+  return rectangles_for_strips(work_field, crop.strips)
+end
+
+function field.completed_rectangles(work_field)
+  return field.operation_rectangles(work_field, "cultivation")
 end
 
 function field.claim_lane(work_field, job_id, machine_id)

@@ -147,6 +147,30 @@ local function run_pure_tests()
   equal(#authority.crops, 0, "harvest deletes harvested crop record")
   equal(field.lifecycle(authority, 3700), "prepared", "harvested field returns to prepared")
 
+  -- The player-facing operation is derived from durable coverage and crop
+  -- timing. No controller state decides what can happen next.
+  local cycle = field.create(8, 1, horizontal, {x = -10, y = 8})
+  equal(field.next_operation(cycle, 0), "cultivation", "new field starts with cultivation")
+  equal(field.commit_operation(cycle, "cultivation", cycle.bounds), 1024, "cycle cultivation")
+  equal(field.next_operation(cycle, 0), "sowing", "prepared field offers sowing")
+  equal(field.commit_operation(cycle, "sowing", cycle.bounds, 100), 1024, "cycle sowing")
+  equal(field.crop_stage(cycle.crops[1], 100), "sown", "new crop visual stage")
+  equal(field.crop_stage(cycle.crops[1], 1900), "growing", "mid-growth visual stage")
+  equal(field.next_operation(cycle, 1900), nil, "growing crop has no operation")
+  equal(field.crop_stage(cycle.crops[1], 3700), "ready", "mature crop visual stage")
+  equal(field.next_operation(cycle, 3700), "harvesting", "ready crop offers harvesting")
+  equal(field.next_uncovered_for(cycle, "harvesting").x, 0, "harvesting starts at its first uncovered tile")
+  equal(field.commit_operation(cycle, "harvesting", {left = 0, top = 0, right = 32, bottom = 4}, 3700, 128),
+    128, "cycle harvest partial lane")
+  equal(field.next_uncovered_for(cycle, "harvesting").x, 32, "harvesting follows its own authoritative coverage")
+  equal(field.operation_rectangle_is_uncovered(cycle, "harvesting", {left = 0, top = 0, right = 32, bottom = 4}), false,
+    "harvested coverage cannot be transferred twice")
+  field.begin_operation(cycle)
+  truthy(field.advance_lane(cycle), "cycle second lane for westbound harvest geometry")
+  local westbound_harvest = field.next_uncovered_rectangle(cycle, "harvesting")
+  equal(westbound_harvest.left, 63, "westbound harvest begins at the final in-bounds tile")
+  equal(westbound_harvest.right, 64, "westbound harvest rectangle stays inside field bounds")
+
   local legacy = field.create(7, 1, horizontal, {x = -10, y = 8})
   field.commit(legacy, {left = 0, top = 0, right = 64, bottom = 4})
   legacy.schema_version = nil
@@ -362,6 +386,116 @@ local function init_capture()
   }
 end
 
+-- --------------------------------------------------------------- crop cycle
+
+local function init_cycle()
+  local surface = build_surface("crop-cycle")
+  storage.cycle_surface = surface.index
+  storage.cycle_storage = surface.create_entity({name = "farming-storage-container", position = {x = -10, y = 20}, force = game.forces.player})
+  setup_slice(surface.index, "crop cycle")
+  storage.cycle_operation = "cultivation"
+  storage.cycle_started = game.tick
+  storage.cycle_sow_paused = false
+  storage.cycle_sow_resumed = false
+  storage.cycle_storage_destroyed = false
+  storage.cycle_storage_retried = false
+  storage.cycle_tractor_destroyed = false
+  storage.cycle_tractor_replaced = false
+end
+
+local function drive_cycle(event)
+  local snap = snapshot(storage.cycle_surface)
+  if snap.job.state == "failed" then
+    if storage.cycle_storage_destroyed and not storage.cycle_storage_retried then
+      equal(snap.field.harvested_area, 0, "missing destination changes no harvest coverage")
+      equal(snap.field.sown_area, 1024, "missing destination retains ready crop coverage")
+      storage.cycle_storage = game.get_surface(storage.cycle_surface).create_entity({
+        name = "farming-storage-container", position = {x = -10, y = 20}, force = game.forces.player
+      })
+      truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume after storage replacement")
+      storage.cycle_storage_retried = true
+      return
+    end
+    if storage.cycle_tractor_destroyed and not storage.cycle_tractor_replaced then
+      equal(snap.field.harvested_area, storage.cycle_harvest_area_before_destroy,
+        "tractor loss changes no harvested coverage")
+      local replaced, message = remote.call("factorio_farming", "debug_replace_tractor",
+        storage.cycle_surface, TRACTOR_POSITION)
+      truthy(replaced, message or "replace harvest tractor")
+      truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume after harvest tractor replacement")
+      storage.cycle_tractor_replaced = true
+      return
+    end
+    local inventory = storage.cycle_storage.get_inventory(defines.inventory.chest)
+    write_result("cycle", {passed = false, reason = snap.job.failure, operation = storage.cycle_operation, snapshot = snap,
+      wheat_stack_size = prototypes.item["farming-wheat"].stack_size,
+      storage_slots = #inventory,
+      stored_wheat = inventory.get_item_count("farming-wheat")})
+    fail("crop cycle failed: " .. tostring(snap.job.failure))
+  end
+  if event.tick - storage.cycle_started > 90000 then
+    write_result("cycle", {passed = false, reason = "timeout", operation = storage.cycle_operation, snapshot = snap,
+      wheat_stack_size = prototypes.item["farming-wheat"].stack_size,
+      storage_slots = #storage.cycle_storage.get_inventory(defines.inventory.chest)})
+    fail("crop cycle timeout")
+  end
+  if storage.cycle_sow_pause_until then
+    equal(snap.job.state, "paused", "sowing stays paused")
+    equal(snap.field.sown_area, storage.cycle_sow_pause_area, "sowing pause changes no coverage")
+    if event.tick >= storage.cycle_sow_pause_until then
+      truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume sowing")
+      storage.cycle_sow_pause_until = nil
+      storage.cycle_sow_resumed = true
+    end
+    return
+  end
+  if storage.cycle_operation == "sowing" and not storage.cycle_sow_paused and
+     snap.job.state == "working" and snap.field.sown_area >= 64 then
+    truthy(remote.call("factorio_farming", "debug_pause", storage.cycle_surface), "pause sowing")
+    storage.cycle_sow_paused = true
+    storage.cycle_sow_pause_area = snap.field.sown_area
+    storage.cycle_sow_pause_until = event.tick + 60
+    return
+  end
+  if storage.cycle_operation == "harvesting" and not storage.cycle_storage_destroyed and
+     snap.job.state == "working" and snap.field.harvested_area == 0 then
+    storage.cycle_storage.destroy()
+    storage.cycle_storage_destroyed = true
+    return
+  end
+  if storage.cycle_operation == "harvesting" and storage.cycle_storage_retried and
+     not storage.cycle_tractor_destroyed and snap.job.state == "working" and snap.field.harvested_area >= 64 then
+    storage.cycle_harvest_area_before_destroy = snap.field.harvested_area
+    truthy(remote.call("factorio_farming", "debug_destroy_tractor", storage.cycle_surface), "destroy harvest tractor")
+    storage.cycle_tractor_destroyed = true
+    return
+  end
+  if snap.job.state == "completed" and storage.cycle_operation == "cultivation" then
+    equal(snap.field.cultivated_area, 1024, "crop cycle cultivation coverage")
+    truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.cycle_surface), "crop cycle sowing start")
+    storage.cycle_operation = "sowing"
+  elseif snap.job.state == "completed" and storage.cycle_operation == "sowing" then
+    truthy(storage.cycle_sow_resumed, "sowing pause and explicit resume completed")
+    equal(snap.field.sown_area, 1024, "crop cycle sowing coverage")
+    equal(snap.field.lifecycle, "growing", "crop cycle enters growth")
+    storage.cycle_operation = "growing"
+  elseif storage.cycle_operation == "growing" then
+    if snap.field.lifecycle == "ready" then
+      truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.cycle_surface), "crop cycle harvest start")
+      storage.cycle_operation = "harvesting"
+    end
+  elseif snap.job.state == "completed" and storage.cycle_operation == "harvesting" then
+    truthy(storage.cycle_storage_retried, "harvest retries after destination replacement")
+    truthy(storage.cycle_tractor_replaced, "harvest retries after tractor replacement")
+    equal(snap.field.harvested_area, 1024, "crop cycle harvest coverage")
+    equal(snap.field.sown_area, 0, "crop cycle removes harvested sowing coverage")
+    equal(storage.cycle_storage.get_inventory(defines.inventory.chest).get_item_count("farming-wheat"), 1024,
+      "crop cycle deposits one wheat per tile")
+    write_result("cycle", {passed = true, completed_area = snap.field.cultivated_area, wheat = 1024})
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
 -- Freezes the current state into a named save. `test_capture` travels inside the
 -- save and tells the replay driver which phase it is looking at.
 local function save_phase(capture, phase, snap, tick)
@@ -554,6 +688,8 @@ script.on_init(function()
   run_pure_tests()
   if mode == "capture" then
     init_capture()
+  elseif mode == "cycle" then
+    init_cycle()
   elseif mode == "functional" then
     init_functional()
   else
@@ -564,6 +700,8 @@ end)
 script.on_event(defines.events.on_tick, function(event)
   if mode == "capture" then
     drive_capture(event)
+  elseif mode == "cycle" then
+    drive_cycle(event)
   elseif mode == "replay" then
     drive_replay(event)
   else

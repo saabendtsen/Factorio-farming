@@ -125,6 +125,20 @@ else {
 
 # ------------------------------------------------------------------ capture
 
+Write-Stage "Crop cycle acceptance flow"
+Set-TestMode "cycle"
+$cycleSave = Join-Path $RunRoot "cycle-test.zip"
+Invoke-Factorio "cycle-create" @("--create", $cycleSave) | Out-Null
+if (-not (Test-Path $cycleSave)) { Write-Fail "crop cycle map creation" }
+else {
+  Invoke-Factorio "cycle" @("--benchmark", $cycleSave, "--benchmark-ticks", "95000", "--benchmark-runs", "1") | Out-Null
+  $cycle = Get-Result "cycle"
+  if ($cycle -and $cycle.passed) { Write-Pass "crop cycle: $($cycle.wheat) wheat from $($cycle.completed_area) cultivated tiles" }
+  else { Write-Fail "crop cycle acceptance flow"; Show-ScriptError "cycle" }
+}
+
+# ------------------------------------------------------------------ capture
+
 Write-Stage "Stage 2/4  capture a save in every controller phase"
 Set-TestMode "capture"
 $captureSave = Join-Path $RunRoot "capture.zip"
