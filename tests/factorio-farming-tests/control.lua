@@ -123,6 +123,66 @@ local function run_pure_tests()
   equal(completed[1].top, 0, "completed projection top")
   equal(completed[1].bottom, 16, "completed projection bottom")
 
+  -- Version-2 field authority is pure Lua: each operation owns normalized
+  -- coverage and only sowing creates durable crop records.
+  local authority = field.create(6, 1, horizontal, {x = -10, y = 8})
+  equal(field.commit_operation(authority, "sowing", {left = 0, top = 0, right = 4, bottom = 4}, 100),
+    0, "sowing without cultivation is rejected")
+  equal(field.commit_operation(authority, "cultivation", {left = 0, top = 0, right = 64, bottom = 16}),
+    1024, "cultivation authority delta")
+  equal(field.commit_operation(authority, "sowing", {left = 0, top = 0, right = 16, bottom = 4}, 100),
+    64, "sowing authority delta")
+  equal(field.operation_area(authority, "sowing"), 64, "sowing coverage area")
+  equal(#authority.crops, 1, "sowing creates one compact crop record")
+  equal(authority.crops[1].sow_tick, 100, "crop record persists sow tick")
+  equal(field.lifecycle(authority, 99), "sowing", "partially sown field remains sowing")
+  equal(field.commit_operation(authority, "harvesting", {left = 0, top = 0, right = 16, bottom = 4}, 100, 64),
+    0, "unready crop cannot be harvested")
+  equal(field.commit_operation(authority, "harvesting", {left = 0, top = 0, right = 16, bottom = 4}, 3700, 0),
+    0, "failed transfer retains ready crop coverage")
+  equal(field.operation_area(authority, "sowing"), 64, "failed transfer does not remove crop coverage")
+  equal(field.commit_operation(authority, "harvesting", {left = 0, top = 0, right = 16, bottom = 4}, 3700, 64),
+    64, "ready crop harvest delta")
+  equal(field.operation_area(authority, "sowing"), 0, "harvest removes live crop coverage")
+  equal(#authority.crops, 0, "harvest deletes harvested crop record")
+  equal(field.lifecycle(authority, 3700), "prepared", "harvested field returns to prepared")
+
+  local legacy = field.create(7, 1, horizontal, {x = -10, y = 8})
+  field.commit(legacy, {left = 0, top = 0, right = 64, bottom = 4})
+  legacy.schema_version = nil
+  local root = {
+    schema_version = 1,
+    next_field_id = 8,
+    next_machine_id = 2,
+    next_job_id = 2,
+    path_queue = {{machine_id = 1}},
+    pending_paths = {one = {machine_id = 1}},
+    outstanding_path_id = 99,
+    surfaces = {[1] = {field = legacy, job = {id = 1, state = "working", machine_id = 1, lane_claim = 1,
+      paused_from = "working", paused_motion = {remaining_waypoints = {{x = 1, y = 1}}}},
+      machine = {id = 1, job_id = 1, controller = {state = "working"}}}}
+  }
+  truthy(field.migrate_storage(root), "legacy storage migration")
+  equal(root.schema_version, 2, "storage schema version")
+  equal(field.operation_area(root.surfaces[1].field, "cultivation"), 256, "legacy coverage converts exactly")
+  equal(field.operation_area(root.surfaces[1].field, "sowing"), 0, "migration invents no sowing")
+  equal(#root.surfaces[1].field.crops, 0, "migration invents no crops")
+  equal(root.surfaces[1].job.state, "paused", "legacy operation requires explicit recovery")
+  equal(root.surfaces[1].job.lane_claim, nil, "legacy lane claim discarded")
+  equal(root.surfaces[1].job.paused_motion, nil, "legacy controller motion discarded")
+  equal(#root.path_queue, 0, "legacy queued paths discarded")
+  equal(next(root.pending_paths), nil, "legacy pending paths discarded")
+
+  local malformed_root = {schema_version = 1, surfaces = {[1] = {field = {
+    id = 9, surface_index = 1, bounds = horizontal, axis = "x", strips = {{{8, 4}}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+    completed_area = 0
+  }, job = {state = "working", machine_id = 4, lane_claim = 1}, machine = {job_id = 4, generation = 2}}}}
+  truthy(field.migrate_storage(malformed_root), "malformed migration completes fail-closed conversion")
+  truthy(malformed_root.surfaces[1].field.migration_failed, "malformed field fails closed")
+  truthy(malformed_root.surfaces[1].field.legacy_raw, "malformed field retains diagnostics")
+  equal(malformed_root.surfaces[1].job.state, "paused", "malformed job is disabled")
+  equal(malformed_root.surfaces[1].machine.job_id, nil, "malformed machine assignment cleared")
+
   local job = {state = "waiting"}
   truthy(slice.transition(job, "reserved"), "waiting to reserved transition")
   truthy(slice.transition(job, "travelling"), "reserved to travelling transition")
