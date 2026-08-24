@@ -764,6 +764,7 @@ function slice.snapshot(surface_index)
   local work_field = state.field
   local job = state.job
   local machine = state.machine
+  local storage_inventory = work_field and destination_inventory(state)
   return {
     field = work_field and {
       id = work_field.id,
@@ -780,7 +781,9 @@ function slice.snapshot(surface_index)
       harvested_area = field_module.operation_area(work_field, "harvesting"),
       lifecycle = field_module.lifecycle(work_field, game.tick),
       crop_count = #work_field.crops,
-      direction = work_field.direction
+      direction = work_field.direction,
+      storage_unit_number = work_field.storage_unit_number,
+      stored_wheat = storage_inventory and storage_inventory.get_item_count("farming-wheat") or 0
     } or nil,
     job = job and {
       id = job.id,

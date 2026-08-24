@@ -496,6 +496,46 @@ local function drive_cycle(event)
   end
 end
 
+-- ------------------------------------------------------- crop save / load
+
+local function save_cycle_phase(capture, phase, snap)
+  storage.test_capture = "cycle-" .. phase
+  storage.capture_area = snap.field.completed_area
+  storage.capture_sown_area = snap.field.sown_area
+  storage.capture_harvested_area = snap.field.harvested_area
+  storage.capture_generation = snap.machine.generation
+  storage.capture_surface = capture.surface
+  capture.saved[#capture.saved + 1] = phase
+  game.auto_save("cycle-" .. phase)
+end
+
+local function init_cycle_capture()
+  init_cycle()
+  storage.cycle_capture = {surface = storage.cycle_surface, stage = "cultivation", saved = {}, started = game.tick}
+end
+
+local function drive_cycle_capture(event)
+  local capture = storage.cycle_capture
+  local snap = snapshot(capture.surface)
+  if event.tick - capture.started > 40000 then fail("crop save capture timeout") end
+  if capture.stage == "cultivation" and snap.job.state == "completed" then
+    truthy(remote.call("factorio_farming", "debug_start_next_operation", capture.surface), "capture start sowing")
+    capture.stage = "sowing"
+  elseif capture.stage == "sowing" and snap.job.state == "working" and snap.field.sown_area >= 64 then
+    save_cycle_phase(capture, "sowing", snap)
+    capture.stage = "sowing-saved"
+  elseif capture.stage == "sowing-saved" and snap.job.state == "completed" then
+    capture.stage = "growing"
+  elseif capture.stage == "growing" and snap.field.lifecycle == "ready" then
+    truthy(remote.call("factorio_farming", "debug_start_next_operation", capture.surface), "capture start harvesting")
+    capture.stage = "harvesting"
+  elseif capture.stage == "harvesting" and snap.job.state == "working" and snap.field.harvested_area >= 64 then
+    save_cycle_phase(capture, "harvesting", snap)
+    write_result("cycle-capture", {passed = true, saved = capture.saved, tick = event.tick})
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
 -- Freezes the current state into a named save. `test_capture` travels inside the
 -- save and tells the replay driver which phase it is looking at.
 local function save_phase(capture, phase, snap, tick)
@@ -565,6 +605,37 @@ end
 
 local verify = {}
 local bench = {}
+local cycle_verify = {}
+
+local function drive_cycle_verify(event, phase)
+  local snap = snapshot(storage.capture_surface)
+  if not cycle_verify.started then
+    cycle_verify.started = event.tick
+    equal(snap.field.completed_area, storage.capture_area, phase .. " load changed cultivation coverage")
+    equal(snap.field.sown_area, storage.capture_sown_area, phase .. " load changed sowing coverage")
+    equal(snap.field.harvested_area, storage.capture_harvested_area, phase .. " load changed harvesting coverage")
+    truthy(snap.machine.generation > storage.capture_generation, phase .. " did not invalidate saved controller")
+    local expected_operation = phase == "cycle-sowing" and "sowing" or "harvesting"
+    equal(snap.job.operation, expected_operation, phase .. " loaded the wrong crop operation")
+    return
+  end
+  if event.tick - cycle_verify.started > 25000 then fail(phase .. " crop replay timeout") end
+  if phase == "cycle-sowing" then
+    if not cycle_verify.harvest_started and snap.job.state == "completed" and snap.field.lifecycle == "ready" then
+      truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.capture_surface), "loaded sowing starts harvest")
+      cycle_verify.harvest_started = true
+      return
+    end
+  end
+  if phase == "cycle-sowing" and not cycle_verify.harvest_started then return end
+  if snap.job.state ~= "completed" then return end
+  equal(snap.field.harvested_area, 1024, phase .. " replay harvest coverage")
+  equal(snap.field.sown_area, 0, phase .. " replay removes sown coverage")
+  equal(snap.field.stored_wheat, 1024, phase .. " replay deposits exact wheat")
+  cycle_verify.done = true
+  write_result("saveload-" .. phase, {passed = true, phase = phase, wheat = 1024})
+  script.on_event(defines.events.on_tick, nil)
+end
 
 local function drive_verify(event, phase)
   if verify.done then return end
@@ -679,7 +750,9 @@ end
 local function drive_replay(event)
   local phase = storage.test_capture
   if not phase then fail("replayed save carries no captured phase") end
-  if phase == "benchmark" then drive_benchmark(event) else drive_verify(event, phase) end
+  if phase == "benchmark" then drive_benchmark(event)
+  elseif phase == "cycle-sowing" or phase == "cycle-harvesting" then drive_cycle_verify(event, phase)
+  else drive_verify(event, phase) end
 end
 
 -- ----------------------------------------------------------------- dispatch
@@ -688,6 +761,8 @@ script.on_init(function()
   run_pure_tests()
   if mode == "capture" then
     init_capture()
+  elseif mode == "cycle-capture" then
+    init_cycle_capture()
   elseif mode == "cycle" then
     init_cycle()
   elseif mode == "functional" then
@@ -700,6 +775,8 @@ end)
 script.on_event(defines.events.on_tick, function(event)
   if mode == "capture" then
     drive_capture(event)
+  elseif mode == "cycle-capture" then
+    drive_cycle_capture(event)
   elseif mode == "cycle" then
     drive_cycle(event)
   elseif mode == "replay" then

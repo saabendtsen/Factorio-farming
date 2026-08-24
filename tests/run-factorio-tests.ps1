@@ -4,7 +4,8 @@
 #   1. functional  - fresh map, full acceptance flow (headless benchmark)
 #   2. capture     - fresh map driven in real time, saved in each controller
 #                    phase plus a clean performance reference save
-#   3. saveload    - each phase save is loaded and driven to exact completion
+#   3. saveload    - each controller and crop-operation save is loaded and
+#                    driven to exact completion
 #   4. benchmark   - five-minute reference run with the script profiler enabled
 #
 # Everything lives under %LOCALAPPDATA%\FactorioFarmingProductionTests and no
@@ -137,6 +138,46 @@ else {
   else { Write-Fail "crop cycle acceptance flow"; Show-ScriptError "cycle" }
 }
 
+# ----------------------------------------------------------- crop capture
+
+Write-Stage "Crop cycle save/load capture"
+Set-TestMode "cycle-capture"
+$cycleCaptureSave = Join-Path $RunRoot "cycle-capture.zip"
+Invoke-Factorio "cycle-capture-create" @("--create", $cycleCaptureSave) | Out-Null
+
+$capturedCyclePhases = @()
+if (-not (Test-Path $cycleCaptureSave)) {
+  Write-Fail "crop cycle capture map creation"
+} else {
+  $cycleCaptureResultPath = Join-Path $OutputRoot "cycle-capture.json"
+  $proc = Start-Process -FilePath $FactorioExe -PassThru `
+    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
+                    "--start-server", $cycleCaptureSave,
+                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
+    -RedirectStandardOutput (Join-Path $LogRoot "cycle-capture.stdout.log") `
+    -RedirectStandardError (Join-Path $LogRoot "cycle-capture.stderr.log")
+
+  $deadline = (Get-Date).AddMinutes(6)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path $cycleCaptureResultPath) { break }
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  Start-Sleep -Seconds 2
+  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
+  Start-Sleep -Seconds 1
+  Save-StageLog "cycle-capture" | Out-Null
+
+  $cycleCapture = Get-Result "cycle-capture"
+  if ($cycleCapture -and $cycleCapture.passed) {
+    $capturedCyclePhases = @($cycleCapture.saved)
+    Write-Pass "captured crop phases: $($capturedCyclePhases -join ', ')"
+  } else {
+    Write-Fail "crop phase capture"
+    Show-ScriptError "cycle-capture"
+  }
+}
+
 # ------------------------------------------------------------------ capture
 
 Write-Stage "Stage 2/4  capture a save in every controller phase"
@@ -196,6 +237,21 @@ foreach ($phase in @("reserved", "travelling", "working", "paused")) {
   } else {
     Write-Fail "save/load $phase"
     Show-ScriptError "saveload-$phase"
+  }
+}
+
+foreach ($phase in @("sowing", "harvesting")) {
+  if ($capturedCyclePhases -notcontains $phase) { Write-Fail "crop save/load $phase (no save captured)"; continue }
+  $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*cycle-$phase.zip" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $save) { Write-Fail "crop save/load $phase (save file missing)"; continue }
+  Invoke-Factorio "saveload-cycle-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", "35000", "--benchmark-runs", "1") | Out-Null
+  $result = Get-Result "saveload-cycle-$phase"
+  if ($result -and $result.passed) {
+    Write-Pass "crop save/load ${phase}: completed with $($result.wheat) wheat"
+  } else {
+    Write-Fail "crop save/load $phase"
+    Show-ScriptError "saveload-cycle-$phase"
   }
 }
 
