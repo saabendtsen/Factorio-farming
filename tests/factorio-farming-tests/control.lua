@@ -399,13 +399,31 @@ local function init_cycle()
   storage.cycle_sow_resumed = false
   storage.cycle_storage_destroyed = false
   storage.cycle_storage_retried = false
+  storage.cycle_storage_full = false
+  storage.cycle_storage_full_retried = false
   storage.cycle_tractor_destroyed = false
   storage.cycle_tractor_replaced = false
 end
 
 local function drive_cycle(event)
   local snap = snapshot(storage.cycle_surface)
+  if storage.cycle_operation ~= "growing" and snap.job.state ~= "completed" then
+    equal(snap.job.implement, storage.cycle_operation, "crop cycle uses its fixed operation implement")
+  end
   if snap.job.state == "failed" then
+    if storage.cycle_storage_full and not storage.cycle_storage_full_retried then
+      equal(snap.field.harvested_area, 0, "full destination changes no harvest coverage")
+      equal(snap.field.sown_area, 1024, "full destination retains ready crop coverage")
+      equal(storage.cycle_storage.get_inventory(defines.inventory.chest).get_item_count("farming-wheat"),
+        storage.cycle_storage_full_wheat, "full destination accepts no partial wheat")
+      storage.cycle_storage.destroy()
+      storage.cycle_storage = game.get_surface(storage.cycle_surface).create_entity({
+        name = "farming-storage-container", position = {x = -10, y = 20}, force = game.forces.player
+      })
+      truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume after full storage replacement")
+      storage.cycle_storage_full_retried = true
+      return
+    end
     if storage.cycle_storage_destroyed and not storage.cycle_storage_retried then
       equal(snap.field.harvested_area, 0, "missing destination changes no harvest coverage")
       equal(snap.field.sown_area, 1024, "missing destination retains ready crop coverage")
@@ -457,7 +475,7 @@ local function drive_cycle(event)
     storage.cycle_sow_pause_until = event.tick + 60
     return
   end
-  if storage.cycle_operation == "harvesting" and not storage.cycle_storage_destroyed and
+  if storage.cycle_operation == "harvesting" and storage.cycle_storage_full_retried and not storage.cycle_storage_destroyed and
      snap.job.state == "working" and snap.field.harvested_area == 0 then
     storage.cycle_storage.destroy()
     storage.cycle_storage_destroyed = true
@@ -481,6 +499,10 @@ local function drive_cycle(event)
     storage.cycle_operation = "growing"
   elseif storage.cycle_operation == "growing" then
     if snap.field.lifecycle == "ready" then
+      local inventory = storage.cycle_storage.get_inventory(defines.inventory.chest)
+      storage.cycle_storage_full_wheat = inventory.insert({name = "farming-wheat", count = 10000000})
+      truthy(not inventory.can_insert({name = "farming-wheat", count = 1}), "crop cycle storage is full")
+      storage.cycle_storage_full = true
       truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.cycle_surface), "crop cycle harvest start")
       storage.cycle_operation = "harvesting"
     end

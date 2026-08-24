@@ -14,6 +14,14 @@ local start_next_operation
 local WHEAT_ITEM = "farming-wheat"
 local STORAGE_RADIUS = 32
 
+local function operation_implement(machine, operation_name)
+  local implement = machine and machine.implements and machine.implements[operation_name]
+  if not implement or implement.work_width ~= field_module.constants.work_width then
+    return nil, "The tractor does not have a compatible " .. tostring(operation_name) .. " implement."
+  end
+  return implement
+end
+
 local function copy_position(position)
   return {x = position.x, y = position.y}
 end
@@ -477,12 +485,15 @@ start_next_operation = function(state, player)
     notify(player, "Crops are still growing; no field operation is ready.")
     return false
   end
+  local implement, implement_error = operation_implement(machine, operation_name)
+  if not implement then notify(player, implement_error); return false, implement_error end
   if operation_name == "harvesting" then
     local designated, message = designate_storage(state)
     if not designated then notify(player, message); return false end
   end
   field_module.begin_operation(state.field)
   job.operation = operation_name
+  job.implement = operation_name
   job.state = "waiting"
   job.failure = nil
   job.generation = job.generation + 1
@@ -789,6 +800,7 @@ function slice.snapshot(surface_index)
       id = job.id,
       state = job.state,
       operation = job.operation,
+      implement = job.implement,
       machine_id = job.machine_id,
       has_claim = job.lane_claim ~= nil,
       generation = job.generation,
