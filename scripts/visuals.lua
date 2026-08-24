@@ -45,6 +45,17 @@ local function build_specs(work_field)
   for _, rectangle in ipairs(field_module.completed_rectangles(work_field)) do
     specs[#specs + 1] = rectangle_spec(rectangle, {0.45, 0.24, 0.08, 0.6}, true)
   end
+  local crop_colors = {
+    sown = {0.72, 0.58, 0.20, 0.45},
+    growing = {0.20, 0.72, 0.25, 0.5},
+    ready = {0.92, 0.78, 0.12, 0.6}
+  }
+  for _, crop in ipairs(work_field.crops) do
+    local color = crop_colors[field_module.crop_stage(crop, game.tick)]
+    for _, rectangle in ipairs(field_module.crop_rectangles(work_field, crop)) do
+      specs[#specs + 1] = rectangle_spec(rectangle, color, true)
+    end
+  end
   return specs
 end
 
