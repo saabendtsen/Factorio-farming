@@ -256,6 +256,21 @@ local function snapshot(surface_index)
   return remote.call("factorio_farming", "snapshot", surface_index)
 end
 
+local function run_contextual_action_tests()
+  local surface = build_surface("contextual-action")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "contextual action setup failed")
+  local status = remote.call("factorio_farming", "contextual_status", surface.index)
+  local state = snapshot(surface.index)
+
+  equal(status.vehicle.name, "farming-tractor", "contextual status identifies the farming vehicle")
+  equal(status.vehicle.unit_number, state.machine.unit_number, "contextual status identifies the active tractor")
+  equal(status.vehicle.state, "ready", "new tractor is ready for the contextual action")
+  equal(status.storage.state, "unassigned", "contextual status reports that no storage container is designated")
+  equal(status.next_field_operation, "cultivation", "contextual status exposes exactly the next valid field operation")
+end
+
 -- ---------------------------------------------------------------- functional
 
 local function init_functional()
@@ -503,7 +518,16 @@ local function drive_cycle(event)
       storage.cycle_storage_full_wheat = inventory.insert({name = "farming-wheat", count = 10000000})
       truthy(not inventory.can_insert({name = "farming-wheat", count = 1}), "crop cycle storage is full")
       storage.cycle_storage_full = true
+      local ready_status = remote.call("factorio_farming", "contextual_status", storage.cycle_surface)
+      equal(ready_status.next_field_operation, "harvesting", "ready field exposes harvesting as its next field operation")
+      equal(ready_status.storage.state, "eligible", "ready field identifies an eligible storage container")
+      equal(ready_status.storage.unit_number, storage.cycle_storage.unit_number,
+        "ready field identifies the eligible storage container")
       truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.cycle_surface), "crop cycle harvest start")
+      local contextual_status = remote.call("factorio_farming", "contextual_status", storage.cycle_surface)
+      equal(contextual_status.storage.state, "designated", "harvest contextual status identifies its storage container")
+      equal(contextual_status.storage.unit_number, storage.cycle_storage.unit_number,
+        "harvest contextual status identifies the designated storage container")
       storage.cycle_operation = "harvesting"
     end
   elseif snap.job.state == "completed" and storage.cycle_operation == "harvesting" then
@@ -781,6 +805,7 @@ end
 
 script.on_init(function()
   run_pure_tests()
+  run_contextual_action_tests()
   if mode == "capture" then
     init_capture()
   elseif mode == "cycle-capture" then

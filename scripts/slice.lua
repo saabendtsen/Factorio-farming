@@ -237,8 +237,7 @@ local function destination_inventory(state)
   return nil
 end
 
-local function designate_storage(state)
-  local work_field = state.field
+local function nearest_storage_container(work_field)
   local surface = game.get_surface(work_field.surface_index)
   local candidates = surface.find_entities_filtered({type = "container", position = work_field.entrance, radius = STORAGE_RADIUS})
   table.sort(candidates, function(first, second)
@@ -247,7 +246,12 @@ local function designate_storage(state)
     if first_distance ~= second_distance then return first_distance < second_distance end
     return first.unit_number < second.unit_number
   end)
-  local container = candidates[1]
+  return candidates[1]
+end
+
+local function designate_storage(state)
+  local work_field = state.field
+  local container = nearest_storage_container(work_field)
   if not container then return false, "Place a storage container within 32 tiles of the field entrance before harvesting." end
   work_field.storage_unit_number = container.unit_number
   work_field.storage_position = copy_position(container.position)
@@ -469,6 +473,47 @@ function slice.resume(player)
   return resume_state(surface_state(player.surface.index), player)
 end
 
+function slice.contextual_status(surface_index)
+  local state = surface_state(surface_index)
+  if not state.field or not state.job then return nil end
+
+  local machine = state.machine
+  local machine_entity = machine and movement.entity(machine)
+  local storage_inventory, storage_entity = destination_inventory(state)
+  local eligible_storage = not storage_inventory and nearest_storage_container(state.field)
+  if eligible_storage then storage_entity = eligible_storage end
+  local requested_operation = state.job.state == "completed" and field_module.next_operation(state.field, game.tick) or nil
+  local next_field_operation = requested_operation
+  local unavailable_reason = nil
+  if requested_operation and not machine_entity then
+    next_field_operation = nil
+    unavailable_reason = "The farming tractor is missing."
+  elseif requested_operation and not operation_implement(machine, requested_operation) then
+    next_field_operation = nil
+    unavailable_reason = "The farming tractor lacks the required implement."
+  elseif requested_operation == "harvesting" and not storage_inventory and not eligible_storage then
+    next_field_operation = nil
+    unavailable_reason = "Place a storage container within 32 tiles of the field entrance."
+  end
+
+  return {
+    lifecycle = field_module.lifecycle(state.field, game.tick),
+    vehicle = {
+      name = "farming-tractor",
+      unit_number = machine and machine.unit_number or nil,
+      state = machine_entity and (state.job.state == "completed" and "ready" or state.job.state) or "missing"
+    },
+    storage = {
+      name = "farming-storage-container",
+      unit_number = storage_entity and storage_entity.unit_number or state.field.storage_unit_number,
+      state = storage_inventory and "designated" or (eligible_storage and "eligible" or
+        (state.field.storage_unit_number and "missing" or "unassigned"))
+    },
+    next_field_operation = next_field_operation,
+    unavailable_reason = unavailable_reason
+  }
+end
+
 start_next_operation = function(state, player)
   local job = state.job
   local machine = state.machine
@@ -509,18 +554,22 @@ function slice.show_contextual_action(player)
   local gui = player.gui.left
   local existing = gui.farming_field_action
   if existing then existing.destroy() end
-  local state = surface_state(player.surface.index)
-  if not state.field or not state.job then return end
-  local lifecycle = field_module.lifecycle(state.field, game.tick)
+  local status = slice.contextual_status(player.surface.index)
+  if not status then return end
   local frame = gui.add({type = "frame", name = "farming_field_action", direction = "vertical", caption = "Farming field"})
-  frame.add({type = "label", caption = "Status: " .. lifecycle})
-  local operation_name = field_module.next_operation(state.field, game.tick)
-  if state.job.state == "completed" and operation_name then
-    frame.add({type = "button", name = "farming_field_primary_action", caption = "Start " .. operation_name})
-  elseif state.job.state == "completed" then
-    frame.add({type = "label", caption = "Crops are growing"})
+  frame.add({type = "label", caption = "Status: " .. status.lifecycle})
+  local vehicle = status.vehicle
+  local vehicle_identity = vehicle.unit_number and ("#" .. vehicle.unit_number) or "unavailable"
+  frame.add({type = "label", caption = "Vehicle: farming tractor " .. vehicle_identity .. " (" .. vehicle.state .. ")"})
+  local storage = status.storage
+  local storage_identity = storage.unit_number and ("#" .. storage.unit_number) or "none designated"
+  frame.add({type = "label", caption = "Storage container: " .. storage_identity .. " (" .. storage.state .. ")"})
+  if status.next_field_operation then
+    frame.add({type = "button", name = "farming_field_primary_action", caption = "Start " .. status.next_field_operation})
+  elseif status.vehicle.state == "ready" then
+    frame.add({type = "label", caption = status.unavailable_reason or "Crops are growing"})
   else
-    frame.add({type = "label", caption = "Tractor: " .. state.job.operation .. " (" .. state.job.state .. ")"})
+    frame.add({type = "label", caption = "Field operation in progress"})
   end
 end
 
@@ -729,7 +778,7 @@ function slice.on_object_destroyed(event)
   end
 end
 
-function slice.debug_setup(surface_index, bounds, tractor_position)
+function slice.debug_setup(surface_index, bounds, tractor_position, start_operation)
   local surface = game.get_surface(surface_index)
   local machine, error_message = create_machine(surface, game.forces.player, tractor_position)
   if not machine then return false, error_message end
@@ -740,6 +789,7 @@ function slice.debug_setup(surface_index, bounds, tractor_position)
   if not normalized then return false, normalize_error end
   local work_field, field_error = create_field_job(surface_index, normalized, tractor_position)
   if not work_field then return false, field_error end
+  if start_operation == false then return true end
   return start_next_operation(surface_state(surface_index))
 end
 
