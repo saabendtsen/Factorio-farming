@@ -72,6 +72,10 @@ local function notify(player, message)
   if player and player.valid then player.print(formatted) else game.print(formatted) end
 end
 
+local function enable_setup_shortcut(player)
+  if player and player.valid then player.set_shortcut_available("farming-setup", true) end
+end
+
 local function create_machine(surface, force, position)
   local root = ensure_root()
   local state = surface_state(surface.index)
@@ -207,6 +211,7 @@ end
 
 function slice.on_init()
   ensure_root()
+  for _, player in pairs(game.players) do enable_setup_shortcut(player) end
 end
 
 function slice.on_configuration_changed()
@@ -214,6 +219,15 @@ function slice.on_configuration_changed()
   for _, state in pairs(root.surfaces) do
     if state.field and not state.field.migration_failed then visuals.mark_dirty(state.field) end
   end
+  for _, player in pairs(game.players) do enable_setup_shortcut(player) end
+end
+
+function slice.on_player_created(event)
+  enable_setup_shortcut(game.get_player(event.player_index))
+end
+
+function slice.on_player_joined_game(event)
+  enable_setup_shortcut(game.get_player(event.player_index))
 end
 
 local function distance_squared(first, second)
@@ -344,23 +358,75 @@ local function recover_loaded_state()
   end
 end
 
+function slice.show_setup_hint(player)
+  local gui = player.gui.left
+  local existing = gui.farming_setup_hint
+  if existing then existing.destroy() end
+  local frame = gui.add({type = "frame", name = "farming_setup_hint", direction = "vertical", caption = "Farming setup"})
+  frame.add({type = "label", caption = "1. Select one 64 by 16 tile field with the planner in your cursor."})
+  frame.add({type = "label", caption = "2. Then use the Farming field panel to start the next field operation."})
+end
+
+local function clear_setup_hint(player)
+  local existing = player.gui.left.farming_setup_hint
+  if existing then existing.destroy() end
+end
+
+local function preserve_cursor_stack(player)
+  local cursor = player.cursor_stack
+  if not cursor or not cursor.valid_for_read then return true end
+
+  -- A planner is already in its correct, cursor-only home. Replacing it in
+  -- place prevents repeated setup from ever putting a planner in inventory.
+  if cursor.name == "farming-field-planner" then
+    cursor.clear()
+    return true
+  end
+
+  local inventory = player.get_main_inventory()
+  local slot = inventory and inventory.find_empty_stack()
+  if not slot or not slot.set_stack(cursor) then
+    notify(player, "Your cursor item could not be safely moved to your inventory. Clear an inventory slot before setting up farming.")
+    return false
+  end
+  cursor.clear()
+  return true
+end
+
 function slice.setup(player)
+  -- The planner is cursor-only. Never replace a held stack unless it has first
+  -- been copied as a complete stack into a real inventory slot.
+  if not preserve_cursor_stack(player) then return false end
+
   local state = surface_state(player.surface.index)
   local machine, error_message = create_machine(player.surface, player.force, player.position)
   if not machine then notify(player, error_message); return false end
 
   local cursor = player.cursor_stack
-  if cursor and cursor.valid then
-    cursor.clear()
-    cursor.set_stack({name = "farming-field-planner", count = 1})
-    player.cursor_stack_temporary = true
+  if not cursor.set_stack({name = "farming-field-planner", count = 1}) then
+    notify(player, "The field planner could not be placed in your cursor.")
+    return false
   end
+  player.cursor_stack_temporary = true
   if state.job and state.job.state == "failed" then
     notify(player, "Replacement tractor registered. Run /farming-slice-resume to continue.")
   else
     notify(player, "Tractor ready. Select one 64 by 16 tile field with the planner.")
   end
+  slice.show_setup_hint(player)
   return true
+end
+
+function slice.on_lua_shortcut(event)
+  if event.prototype_name ~= "farming-setup" then return end
+  local player = game.get_player(event.player_index)
+  if player then slice.setup(player) end
+end
+
+function slice.on_setup_input(event)
+  if event.input_name ~= "farming-setup" then return end
+  local player = game.get_player(event.player_index)
+  if player then slice.setup(player) end
 end
 
 function slice.on_selected_area(event)
@@ -371,6 +437,7 @@ function slice.on_selected_area(event)
   local work_field, create_error = create_field_job(event.surface.index, bounds, player.position)
   if not work_field then notify(player, create_error); return end
   surface_state(event.surface.index).job.player_index = event.player_index
+  clear_setup_hint(player)
   notify(player, "Field accepted. Use the contextual field action to start cultivation.")
   slice.show_contextual_action(player)
 end
@@ -565,6 +632,7 @@ function slice.show_contextual_action(player)
   local storage_identity = storage.unit_number and ("#" .. storage.unit_number) or "none designated"
   frame.add({type = "label", caption = "Storage container: " .. storage_identity .. " (" .. storage.state .. ")"})
   if status.next_field_operation then
+    frame.add({type = "label", caption = "Next: start " .. status.next_field_operation .. "."})
     frame.add({type = "button", name = "farming_field_primary_action", caption = "Start " .. status.next_field_operation})
   elseif status.vehicle.state == "ready" then
     frame.add({type = "label", caption = status.unavailable_reason or "Crops are growing"})
@@ -791,6 +859,12 @@ function slice.debug_setup(surface_index, bounds, tractor_position, start_operat
   if not work_field then return false, field_error end
   if start_operation == false then return true end
   return start_next_operation(surface_state(surface_index))
+end
+
+function slice.debug_player_setup(player_index)
+  local player = game.get_player(player_index)
+  if not player then return false, "Player is unavailable." end
+  return slice.setup(player)
 end
 
 function slice.debug_start_next_operation(surface_index)

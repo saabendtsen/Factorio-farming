@@ -5,6 +5,10 @@ script.on_load(slice.on_load)
 script.on_configuration_changed(slice.on_configuration_changed)
 
 script.on_event(defines.events.on_player_selected_area, slice.on_selected_area)
+script.on_event(defines.events.on_lua_shortcut, slice.on_lua_shortcut)
+script.on_event(defines.events.on_player_created, slice.on_player_created)
+script.on_event(defines.events.on_player_joined_game, slice.on_player_joined_game)
+script.on_event("farming-setup", slice.on_setup_input)
 script.on_event(defines.events.on_script_path_request_finished, slice.on_path_finished)
 script.on_event(defines.events.on_object_destroyed, slice.on_object_destroyed)
 script.on_event(defines.events.on_gui_click, slice.on_gui_click)
@@ -33,6 +37,7 @@ remote.add_interface("factorio_farming", {
   contextual_status = slice.contextual_status,
   debug_destroy_tractor = slice.debug_destroy_tractor,
   debug_replace_tractor = slice.debug_replace_tractor,
+  debug_player_setup = slice.debug_player_setup,
   snapshot = slice.snapshot,
   debug_profile_start = slice.debug_profile_start,
   debug_profile_stop = slice.debug_profile_stop,
