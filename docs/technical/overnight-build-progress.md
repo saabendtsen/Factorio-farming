@@ -16,8 +16,8 @@ It is updated only after a milestone has passed its stated verification gate.
 | Milestone | State | Verification / handoff |
 | --- | --- | --- |
 | Player-facing setup and placeholder machinery visuals | Complete | Ctrl+F and toolbar shortcut, onboarding, cursor-safe planner handling, placeholder tractor identity; `tests/run-factorio-tests.ps1 -SkipBenchmark` passed all functional, crop, capture, and replay stages |
-| Multi-field scheduler design review | In progress | Pending independent architecture and test reviews |
-| Multi-field scheduler implementation | Pending | Starts only after the visual milestone is verified |
+| Multi-field scheduler design review | Complete | Independent architecture and test reviews selected schema v3 collections, deterministic dispatch ordering, and staged fleet acceptance |
+| Multi-field scheduler implementation | In progress | Schema-v3 compatibility migration, fail-closed corruption handling, and singleton compatibility verified; shared queue behavior is next |
 | Independent standards/spec review | Pending | Required before a pull request |
 
 ## Non-goals for this pass

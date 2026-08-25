@@ -187,7 +187,7 @@ local function run_pure_tests()
       machine = {id = 1, job_id = 1, controller = {state = "working"}}}}
   }
   truthy(field.migrate_storage(root), "legacy storage migration")
-  equal(root.schema_version, 2, "storage schema version")
+  equal(root.schema_version, 3, "storage schema version")
   equal(field.operation_area(root.surfaces[1].field, "cultivation"), 256, "legacy coverage converts exactly")
   equal(field.operation_area(root.surfaces[1].field, "sowing"), 0, "migration invents no sowing")
   equal(#root.surfaces[1].field.crops, 0, "migration invents no crops")
@@ -196,6 +196,129 @@ local function run_pure_tests()
   equal(root.surfaces[1].job.paused_motion, nil, "legacy controller motion discarded")
   equal(#root.path_queue, 0, "legacy queued paths discarded")
   equal(next(root.pending_paths), nil, "legacy pending paths discarded")
+
+  -- Schema v3 introduces durable collections without changing the current
+  -- one-field player experience. The singleton records remain the public
+  -- compatibility aliases while their identities are indexed for a later
+  -- scheduler to use.
+  local singleton_field = field.create(12, 2, horizontal, {x = -10, y = 8})
+  singleton_field.schema_version = 2
+  local singleton_root = {
+    schema_version = 2,
+    next_field_id = 13,
+    next_machine_id = 8,
+    next_job_id = 10,
+    surfaces = {[2] = {
+      field = singleton_field,
+      machine = {id = 7, surface_index = 2, job_id = 9, controller = {state = "working", recoveries = 2}},
+      job = {id = 9, machine_id = 7, state = "working", operation = "cultivation", lane_claim = 1,
+        paused_motion = {remaining_waypoints = {{x = 1, y = 1}}}}
+    }}
+  }
+  truthy(field.migrate_storage(singleton_root), "v2 singleton storage migration")
+  equal(singleton_root.schema_version, 3, "v2 storage reaches schema v3")
+  equal(singleton_root.fields[12], singleton_root.surfaces[2].field, "field collection preserves singleton identity")
+  equal(singleton_root.machines[7], singleton_root.surfaces[2].machine, "machine collection preserves singleton identity")
+  equal(singleton_root.jobs[9], singleton_root.surfaces[2].job, "job collection preserves singleton identity")
+  equal(singleton_root.surfaces[2].field_ids[1], 12, "surface indexes its field")
+  equal(singleton_root.surfaces[2].machine_ids[1], 7, "surface indexes its machine")
+  equal(singleton_root.surfaces[2].job_ids[1], 9, "surface indexes its job")
+  equal(singleton_root.surfaces[2].job.state, "paused", "v2 active job requires explicit recovery")
+  equal(singleton_root.surfaces[2].job.machine_id, nil, "v2 active assignment is discarded")
+  equal(singleton_root.surfaces[2].machine.controller.state, "idle", "v2 controller motion is discarded")
+  truthy(field.migrate_storage(singleton_root), "v3 migration is idempotent")
+  equal(singleton_root.fields[12], singleton_root.surfaces[2].field, "idempotence retains field identity")
+
+  local missing_field_id = field.create(14, 4, horizontal, {x = -10, y = 8})
+  missing_field_id.schema_version = 2
+  local missing_field_id_root = {schema_version = 2, surfaces = {[4] = {
+    field = missing_field_id,
+    job = {id = 11, state = "waiting", operation = "cultivation"}
+  }}}
+  truthy(field.migrate_storage(missing_field_id_root), "missing job field identity migration")
+  equal(missing_field_id_root.surfaces[4].job.field_id, 14, "migration backfills singleton job field identity")
+
+  local corrupt_counter_root = {
+    schema_version = 2,
+    next_field_id = 0,
+    next_machine_id = 1.5,
+    next_job_id = "none",
+    surfaces = {[5] = {field = {migration_failed = true}}}
+  }
+  truthy(field.migrate_storage(corrupt_counter_root), "corrupt counter migration")
+  equal(corrupt_counter_root.next_field_id, 1, "empty corrupt field counter normalizes to a positive integer")
+  equal(corrupt_counter_root.next_machine_id, 1, "empty corrupt machine counter normalizes to a positive integer")
+  equal(corrupt_counter_root.next_job_id, 1, "empty corrupt job counter normalizes to a positive integer")
+
+  local first_duplicate = field.create(20, 6, horizontal, {x = -10, y = 8})
+  local second_duplicate = field.create(20, 7, horizontal, {x = -10, y = 8})
+  first_duplicate.schema_version = 2
+  second_duplicate.schema_version = 2
+  local duplicate_root = {schema_version = 2, next_field_id = 1, next_machine_id = 1, next_job_id = 1, surfaces = {
+    [6] = {field = first_duplicate, machine = {id = 30}, job = {id = 40, state = "waiting"}},
+    [7] = {field = second_duplicate, machine = {id = 30}, job = {id = 40, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(duplicate_root), "duplicate singleton migration")
+  truthy(duplicate_root.surfaces[6].field.migration_failed, "first duplicate surface fails closed")
+  truthy(duplicate_root.surfaces[7].field.migration_failed, "second duplicate surface fails closed")
+  equal(next(duplicate_root.fields), nil, "duplicate fields do not overwrite the scheduler collection")
+  equal(next(duplicate_root.machines), nil, "duplicate machines do not overwrite the scheduler collection")
+  equal(next(duplicate_root.jobs), nil, "duplicate jobs do not overwrite the scheduler collection")
+  equal(duplicate_root.next_field_id, 21, "field counter advances beyond duplicate identities")
+  equal(duplicate_root.next_machine_id, 31, "machine counter advances beyond duplicate identities")
+  equal(duplicate_root.next_job_id, 41, "job counter advances beyond duplicate identities")
+
+  local machine_duplicate_first = field.create(22, 9, horizontal, {x = -10, y = 8})
+  local machine_duplicate_second = field.create(23, 10, horizontal, {x = -10, y = 8})
+  machine_duplicate_first.schema_version = 2
+  machine_duplicate_second.schema_version = 2
+  local machine_duplicate_root = {schema_version = 2, surfaces = {
+    [9] = {field = machine_duplicate_first, machine = {id = 60}, job = {id = 61, state = "waiting"}},
+    [10] = {field = machine_duplicate_second, machine = {id = 60}, job = {id = 62, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(machine_duplicate_root), "duplicate machine singleton migration")
+  truthy(machine_duplicate_root.surfaces[9].field.migration_failed, "first duplicate machine surface fails closed")
+  truthy(machine_duplicate_root.surfaces[10].field.migration_failed, "second duplicate machine surface fails closed")
+  equal(next(machine_duplicate_root.machines), nil, "duplicate machines do not overwrite the scheduler collection")
+
+  local job_duplicate_first = field.create(24, 11, horizontal, {x = -10, y = 8})
+  local job_duplicate_second = field.create(25, 12, horizontal, {x = -10, y = 8})
+  job_duplicate_first.schema_version = 2
+  job_duplicate_second.schema_version = 2
+  local job_duplicate_root = {schema_version = 2, surfaces = {
+    [11] = {field = job_duplicate_first, machine = {id = 70}, job = {id = 71, state = "waiting"}},
+    [12] = {field = job_duplicate_second, machine = {id = 72}, job = {id = 71, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(job_duplicate_root), "duplicate job singleton migration")
+  truthy(job_duplicate_root.surfaces[11].field.migration_failed, "first duplicate job surface fails closed")
+  truthy(job_duplicate_root.surfaces[12].field.migration_failed, "second duplicate job surface fails closed")
+  equal(next(job_duplicate_root.jobs), nil, "duplicate jobs do not overwrite the scheduler collection")
+
+  local completed_field = field.create(50, 8, horizontal, {x = -10, y = 8})
+  completed_field.schema_version = 2
+  local completed_root = {schema_version = 2, surfaces = {[8] = {
+    field = completed_field,
+    machine = {id = 51, job_id = 52, controller = {state = "working"}},
+    job = {id = 52, field_id = 50, machine_id = 51, state = "completed", lane_claim = 1,
+      paused_motion = {remaining_waypoints = {{x = 1, y = 1}}}}
+  }}}
+  truthy(field.migrate_storage(completed_root), "completed singleton migration")
+  equal(completed_root.surfaces[8].job.state, "completed", "completed job retains completion status")
+  equal(completed_root.surfaces[8].job.machine_id, nil, "completed job assignment is discarded")
+  equal(completed_root.surfaces[8].job.lane_claim, nil, "completed job lane claim is discarded")
+  equal(completed_root.surfaces[8].machine.job_id, nil, "completed machine assignment is discarded")
+  equal(completed_root.surfaces[8].machine.controller.state, "idle", "completed machine controller is discarded")
+
+  local malformed_v2_root = {schema_version = 2, surfaces = {[3] = {field = {
+    id = 13, schema_version = 2, surface_index = 3, bounds = horizontal, axis = "x",
+    operations = {cultivation = {strips = {{{8, 4}}}, area = 0}}
+  }, job = {id = 10, state = "working", machine_id = 8, lane_claim = 1},
+  machine = {id = 8, job_id = 10, generation = 2, controller = {state = "working"}}}}}
+  truthy(field.migrate_storage(malformed_v2_root), "malformed v2 migration completes fail-closed conversion")
+  truthy(malformed_v2_root.surfaces[3].field.migration_failed, "malformed v2 field fails closed")
+  equal(malformed_v2_root.surfaces[3].job.state, "paused", "malformed v2 job is disabled")
+  equal(malformed_v2_root.surfaces[3].machine.job_id, nil, "malformed v2 machine assignment cleared")
+  equal(next(malformed_v2_root.fields), nil, "malformed v2 field is excluded from scheduler collection")
 
   local malformed_root = {schema_version = 1, surfaces = {[1] = {field = {
     id = 9, surface_index = 1, bounds = horizontal, axis = "x", strips = {{{8, 4}}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},

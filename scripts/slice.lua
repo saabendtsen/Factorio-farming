@@ -48,17 +48,29 @@ end
 local function ensure_root()
   storage.farming = storage.farming or {}
   local root = storage.farming
-  if root.schema_version ~= 2 then field_module.migrate_storage(root) end
+  if root.schema_version ~= 3 then field_module.migrate_storage(root) end
   root.next_field_id = root.next_field_id or 1
   root.next_machine_id = root.next_machine_id or 1
   root.next_job_id = root.next_job_id or 1
   root.surfaces = root.surfaces or {}
+  root.fields = root.fields or {}
+  root.machines = root.machines or {}
+  root.jobs = root.jobs or {}
   root.path_queue = root.path_queue or {}
   root.pending_paths = root.pending_paths or {}
   root.visual_dirty = root.visual_dirty or {}
   root.visuals = root.visuals or {}
   root.destroy_registrations = root.destroy_registrations or {}
   return root
+end
+
+local function add_surface_identity(state, name, id)
+  local ids = state[name] or {}
+  state[name] = ids
+  for _, existing_id in ipairs(ids) do
+    if existing_id == id then return end
+  end
+  ids[#ids + 1] = id
 end
 
 local function surface_state(surface_index)
@@ -108,6 +120,8 @@ local function create_machine(surface, force, position)
   }
   root.next_machine_id = root.next_machine_id + 1
   state.machine = machine
+  root.machines[machine.id] = machine
+  add_surface_identity(state, "machine_ids", machine.id)
   local registration = script.register_on_object_destroyed(entity)
   root.destroy_registrations[registration] = surface.index
   return machine
@@ -205,6 +219,10 @@ local function create_field_job(surface_index, bounds, player_position)
   root.next_job_id = root.next_job_id + 1
   state.field = work_field
   state.job = job
+  root.fields[work_field.id] = work_field
+  root.jobs[job.id] = job
+  add_surface_identity(state, "field_ids", work_field.id)
+  add_surface_identity(state, "job_ids", job.id)
   visuals.mark_dirty(work_field)
   return work_field
 end
