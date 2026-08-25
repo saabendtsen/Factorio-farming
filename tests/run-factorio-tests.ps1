@@ -140,6 +140,22 @@ else {
 
 # ----------------------------------------------------------- crop capture
 
+Write-Stage "Shared queue scheduler acceptance flow"
+Set-TestMode "queue"
+$queueSave = Join-Path $RunRoot "queue-test.zip"
+Invoke-Factorio "queue-create" @("--create", $queueSave) | Out-Null
+if (-not (Test-Path $queueSave)) { Write-Fail "queue map creation" }
+else {
+  Invoke-Factorio "queue" @("--benchmark", $queueSave, "--benchmark-ticks", "100000", "--benchmark-runs", "1") | Out-Null
+  $queue = Get-Result "queue"
+  if ($queue -and $queue.passed) {
+    Write-Pass "shared queue: priority dispatch, pause/resume, and release completed"
+  } else {
+    Write-Fail "shared queue scheduler"
+    Show-ScriptError "queue"
+  }
+}
+
 Write-Stage "Crop cycle save/load capture"
 Set-TestMode "cycle-capture"
 $cycleCaptureSave = Join-Path $RunRoot "cycle-capture.zip"

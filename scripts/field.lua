@@ -864,4 +864,22 @@ end
 field.constants = {long = EXPECTED_LONG, short = EXPECTED_SHORT, work_width = WORK_WIDTH, growth_ticks = GROWTH_TICKS}
 field._add_interval = add_interval
 
+-- The scheduler order is deliberately domain-level and independent of any
+-- controller iteration order.  A higher priority wins; ties retain the first
+-- request, with the durable job id as the final stable tie-breaker.
+function field.job_precedes(first, second)
+  local function scheduler_number(value, fallback)
+    local number = tonumber(value)
+    if not number or number ~= number or number == math.huge or number == -math.huge then return fallback end
+    return number
+  end
+  local first_priority = scheduler_number(first.priority, 0)
+  local second_priority = scheduler_number(second.priority, 0)
+  if first_priority ~= second_priority then return first_priority > second_priority end
+  local first_tick = scheduler_number(first.request_tick, 0)
+  local second_tick = scheduler_number(second.request_tick, 0)
+  if first_tick ~= second_tick then return first_tick < second_tick end
+  return scheduler_number(first.id, 0) < scheduler_number(second.id, 0)
+end
+
 return field

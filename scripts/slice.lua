@@ -56,6 +56,7 @@ local function ensure_root()
   root.fields = root.fields or {}
   root.machines = root.machines or {}
   root.jobs = root.jobs or {}
+  root.queued_job_ids = root.queued_job_ids or {}
   root.path_queue = root.path_queue or {}
   root.pending_paths = root.pending_paths or {}
   root.visual_dirty = root.visual_dirty or {}
@@ -225,6 +226,101 @@ local function create_field_job(surface_index, bounds, player_position)
   add_surface_identity(state, "job_ids", job.id)
   visuals.mark_dirty(work_field)
   return work_field
+end
+
+local function queued_candidates(root, surface_index)
+  local candidates = {}
+  for _, job_id in ipairs(root.queued_job_ids or {}) do
+    local job = root.jobs[job_id]
+    local work_field = job and root.fields[job.field_id]
+    if job and work_field and work_field.surface_index == surface_index and job.state == "waiting" and
+       job.machine_id == nil and not job.failure then
+      candidates[#candidates + 1] = job
+    end
+  end
+  table.sort(candidates, field_module.job_precedes)
+  return candidates
+end
+
+local function bounds_intersect(first, second)
+  return first.left < second.right and second.left < first.right and
+    first.top < second.bottom and second.top < first.bottom
+end
+
+local function finite_number(value, fallback)
+  local number = tonumber(value)
+  if not number or number ~= number or number == math.huge or number == -math.huge then
+    return fallback
+  end
+  return number
+end
+
+-- A single compatible idle tractor takes exactly one queued job.  Assigning
+-- the collection records to the established surface aliases lets the existing
+-- movement and recovery controller remain the sole authority for field work.
+local function dispatch_queued_jobs(root)
+  local indexes = {}
+  for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
+  table.sort(indexes)
+  for _, index in ipairs(indexes) do
+    local state = root.surfaces[index]
+    local machine = state.machine
+    if machine and machine.job_id == nil and movement.entity(machine) then
+      for _, job in ipairs(queued_candidates(root, index)) do
+        local work_field = root.fields[job.field_id]
+        if operation_implement(machine, job.operation) then
+          state.field = work_field
+          state.job = job
+          if reserve_job(state) then break end
+        end
+      end
+    end
+  end
+end
+
+-- Additional fields live in the v3 collections.  The singleton aliases on a
+-- surface continue to point at the field currently presented to the player,
+-- preserving the original one-field control surface while a tractor works
+-- through a shared queue.
+local function create_queued_field_job(surface_index, bounds, player_position, operation_name, priority)
+  local root = ensure_root()
+  local state = surface_state(surface_index)
+  local machine = state.machine
+  if not machine or not movement.entity(machine) then
+    return nil, "Run /farming-slice-setup before defining the field."
+  end
+  local operation = operation_name or "cultivation"
+  if not operation_implement(machine, operation) then
+    return nil, "The tractor does not have a compatible " .. tostring(operation) .. " implement."
+  end
+  for _, existing in pairs(root.fields) do
+    if existing.surface_index == surface_index and existing.bounds and bounds_intersect(bounds, existing.bounds) then
+      return nil, "Queued fields must not overlap an existing field."
+    end
+  end
+  local work_field = field_module.create(root.next_field_id, surface_index, bounds, player_position)
+  root.next_field_id = root.next_field_id + 1
+  local job = {
+    id = root.next_job_id,
+    field_id = work_field.id,
+    machine_id = nil,
+    state = "waiting",
+    operation = operation,
+    implement = operation,
+    lane_claim = nil,
+    generation = 1,
+    failure = nil,
+    priority = finite_number(priority, 0),
+    request_tick = game.tick
+  }
+  root.next_job_id = root.next_job_id + 1
+  root.fields[work_field.id] = work_field
+  root.jobs[job.id] = job
+  root.queued_job_ids[#root.queued_job_ids + 1] = job.id
+  add_surface_identity(state, "field_ids", work_field.id)
+  add_surface_identity(state, "job_ids", job.id)
+  visuals.mark_dirty(work_field)
+  return job
 end
 
 function slice.on_init()
@@ -787,6 +883,7 @@ end
 local function tick_body(event)
   recover_loaded_state()
   local root = ensure_root()
+  dispatch_queued_jobs(root)
   promote_reserved(root)
   movement.process_path_queue(event.tick)
   local surface_indexes = {}
@@ -889,6 +986,20 @@ function slice.debug_start_next_operation(surface_index)
   return start_next_operation(surface_state(surface_index))
 end
 
+-- Test/automation seam: queue another non-overlapping field for the tractor
+-- already registered on this surface.  Normal player setup remains the
+-- one-field planner flow until the multi-field UI is designed.
+function slice.debug_queue_field(surface_index, bounds, priority, operation_name)
+  local normalized, normalize_error = field_module.normalize_selection({
+    left_top = {x = bounds.left, y = bounds.top},
+    right_bottom = {x = bounds.right, y = bounds.bottom}
+  })
+  if not normalized then return false, normalize_error end
+  local job, create_error = create_queued_field_job(surface_index, normalized,
+    {x = normalized.left - 4, y = (normalized.top + normalized.bottom) / 2}, operation_name, priority)
+  return job ~= nil, create_error, job and job.id
+end
+
 function slice.debug_pause(surface_index)
   return pause_state(surface_state(surface_index))
 end
@@ -912,7 +1023,8 @@ function slice.debug_replace_tractor(surface_index, position)
 end
 
 function slice.snapshot(surface_index)
-  local state = ensure_root().surfaces[surface_index]
+  local root = ensure_root()
+  local state = root.surfaces[surface_index]
   if not state then return nil end
   local work_field = state.field
   local job = state.job
@@ -965,7 +1077,22 @@ function slice.snapshot(surface_index)
       orientation = movement.entity(machine) and movement.entity(machine).orientation or nil
     } or nil,
     pending_path_count = ensure_root().outstanding_path_id and 1 or 0,
-    visual_count = work_field and visuals.object_count(work_field.id) or 0
+    visual_count = work_field and visuals.object_count(work_field.id) or 0,
+    queued_jobs = (function()
+      local result = {}
+      for _, job_id in ipairs(root.queued_job_ids or {}) do
+        local queued = root.jobs[job_id]
+        local queued_field = queued and root.fields[queued.field_id]
+        if queued and queued_field and queued_field.surface_index == surface_index then
+          result[#result + 1] = {id = queued.id, field_id = queued.field_id, state = queued.state,
+            operation = queued.operation, priority = queued.priority, request_tick = queued.request_tick,
+            machine_id = queued.machine_id, failure = queued.failure,
+            completed_area = queued_field.completed_area}
+        end
+      end
+      table.sort(result, function(a, b) return a.id < b.id end)
+      return result
+    end)()
   }
 end
 

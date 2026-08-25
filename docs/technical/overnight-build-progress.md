@@ -17,7 +17,8 @@ It is updated only after a milestone has passed its stated verification gate.
 | --- | --- | --- |
 | Player-facing setup and placeholder machinery visuals | Complete | Ctrl+F and toolbar shortcut, onboarding, cursor-safe planner handling, placeholder tractor identity; `tests/run-factorio-tests.ps1 -SkipBenchmark` passed all functional, crop, capture, and replay stages |
 | Multi-field scheduler design review | Complete | Independent architecture and test reviews selected schema v3 collections, deterministic dispatch ordering, and staged fleet acceptance |
-| Multi-field scheduler implementation | In progress | Schema-v3 compatibility migration, fail-closed corruption handling, and singleton compatibility verified; shared queue behavior is next |
+| Shared queue, priorities, and single-tractor scheduling | Complete | Fresh clean-arena acceptance passed deterministic priority dispatch, pause/resume, exact coverage, tractor-loss failure without requeue, plus invalid-operation and overlap rejection |
+| Multi-field fleet scheduling | In progress | Shared queue is ready; next bounded increment is independently dispatching compatible idle tractors across fields without same-field parallelism |
 | Independent standards/spec review | Pending | Required before a pull request |
 
 ## Non-goals for this pass

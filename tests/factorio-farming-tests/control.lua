@@ -29,6 +29,14 @@ local function write_result(name, result)
 end
 
 local function run_pure_tests()
+  local low_priority = {id = 4, priority = 1, request_tick = 10}
+  local high_priority = {id = 5, priority = 2, request_tick = 20}
+  local earlier_request = {id = 6, priority = 2, request_tick = 19}
+  local same_request_lower_id = {id = 3, priority = 2, request_tick = 19}
+  truthy(field.job_precedes(high_priority, low_priority), "higher-priority job is dispatched first")
+  truthy(field.job_precedes(earlier_request, high_priority), "earlier equal-priority request is dispatched first")
+  truthy(field.job_precedes(same_request_lower_id, earlier_request), "job id stabilizes equal requests")
+
   local horizontal, horizontal_error = field.normalize_selection({
     left_top = {x = 0, y = 0}, right_bottom = {x = 64, y = 16}
   })
@@ -343,8 +351,8 @@ end
 
 local function build_surface(name)
   local surface = game.create_surface("farming-production-slice-test-" .. name, {
-    width = 256,
-    height = 256,
+    width = 384,
+    height = 128,
     peaceful_mode = true,
     autoplace_controls = {}
   })
@@ -352,8 +360,8 @@ local function build_surface(name)
   surface.request_to_generate_chunks({x = 0, y = 0}, 4)
   surface.force_generate_chunk_requests()
   local test_tiles = {}
-  for y = -32, 31 do
-    for x = -32, 95 do
+  for y = -32, 95 do
+    for x = -32, 351 do
       test_tiles[#test_tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
     end
   end
@@ -377,6 +385,77 @@ end
 
 local function snapshot(surface_index)
   return remote.call("factorio_farming", "snapshot", surface_index)
+end
+
+local function queued_job(snap, id)
+  for _, job in ipairs(snap.queued_jobs or {}) do
+    if job.id == id then return job end
+  end
+  return nil
+end
+
+local function init_queue()
+  local surface = build_surface("queue")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "queue tractor setup failed")
+  local rejected, rejection = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 32, top = 0, right = 96, bottom = 16}, 0, "cultivation")
+  truthy(not rejected and string.find(rejection or "", "overlap"), "overlapping queue field rejected")
+  rejected, rejection = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 0, right = 144, bottom = 16}, 0, "not-an-operation")
+  truthy(not rejected and string.find(rejection or "", "compatible"), "unsupported queue operation rejected")
+  local queued, queue_error, high_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "high-priority field queue failed")
+  storage.queue_high_id = high_id
+  queued, queue_error, storage.queue_pause_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 5, "cultivation")
+  truthy(queued, queue_error or "pause field queue failed")
+  queued, queue_error, storage.queue_failed_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 32, right = 144, bottom = 48}, -1, "cultivation")
+  truthy(queued, queue_error or "failed field queue failed")
+  storage.queue_surface = surface.index
+  storage.queue_started = false
+  storage.queue_paused = false
+  storage.queue_resumed = false
+  storage.queue_destroyed = false
+  storage.queue_deadline = game.tick + 99999
+end
+
+local function drive_queue(event)
+  local snap = snapshot(storage.queue_surface)
+  local high = queued_job(snap, storage.queue_high_id)
+  local paused = queued_job(snap, storage.queue_pause_id)
+  local failed = queued_job(snap, storage.queue_failed_id)
+  truthy(high and paused and failed, "queued jobs remain durably visible")
+  if not storage.queue_started and snap.job and snap.job.machine_id then
+    equal(snap.job.id, storage.queue_high_id, "highest priority dispatches first")
+    storage.queue_started = true
+  end
+  if high.state == "completed" and paused.state == "working" and not storage.queue_paused then
+    truthy(remote.call("factorio_farming", "debug_pause", storage.queue_surface), "queued field pauses")
+    storage.queue_paused = true
+  elseif storage.queue_paused and not storage.queue_resumed and paused.state == "paused" then
+    truthy(remote.call("factorio_farming", "debug_resume", storage.queue_surface), "queued field resumes")
+    storage.queue_resumed = true
+  end
+  if paused.state == "completed" and failed.state == "working" and not storage.queue_destroyed then
+    truthy(remote.call("factorio_farming", "debug_destroy_tractor", storage.queue_surface), "queued tractor destruction")
+    storage.queue_destroyed = true
+  end
+  if high.state == "completed" and paused.state == "completed" and failed.state == "failed" then
+    equal(high.completed_area, 1024, "high-priority field exact coverage")
+    equal(paused.completed_area, 1024, "paused field resumes without skipped or duplicate coverage")
+    equal(failed.completed_area, 0, "destroyed tractor leaves unstarted coverage for retry")
+    truthy(storage.queue_paused and storage.queue_resumed, "pause does not requeue the job")
+    truthy(storage.queue_destroyed and failed.machine_id == nil, "failed job is released but never requeued")
+    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= storage.queue_deadline then
+    write_result("queue", {passed = false, snapshot = snap})
+    fail("queue scheduler timeout")
+  end
 end
 
 local function run_contextual_action_tests()
@@ -937,6 +1016,8 @@ script.on_init(function()
     init_cycle()
   elseif mode == "functional" then
     init_functional()
+  elseif mode == "queue" then
+    init_queue()
   else
     fail("mode '" .. tostring(mode) .. "' does not create a map")
   end
@@ -951,6 +1032,8 @@ script.on_event(defines.events.on_tick, function(event)
     drive_cycle(event)
   elseif mode == "replay" then
     drive_replay(event)
+  elseif mode == "queue" then
+    drive_queue(event)
   else
     drive_functional(event)
   end
