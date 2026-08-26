@@ -206,6 +206,44 @@ if (-not (Test-Path $queueCaptureSave)) {
   }
 }
 
+Write-Stage "Two-tractor fleet save/load capture"
+Set-TestMode "fleet-capture"
+$fleetCaptureSave = Join-Path $RunRoot "fleet-capture.zip"
+Invoke-Factorio "fleet-capture-create" @("--create", $fleetCaptureSave) | Out-Null
+
+$capturedFleetPhases = @()
+if (-not (Test-Path $fleetCaptureSave)) {
+  Write-Fail "fleet save/load capture map creation"
+} else {
+  $fleetCaptureResultPath = Join-Path $OutputRoot "fleet-capture.json"
+  $proc = Start-Process -FilePath $FactorioExe -PassThru `
+    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
+                    "--start-server", $fleetCaptureSave,
+                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
+    -RedirectStandardOutput (Join-Path $LogRoot "fleet-capture.stdout.log") `
+    -RedirectStandardError (Join-Path $LogRoot "fleet-capture.stderr.log")
+
+  $deadline = (Get-Date).AddMinutes(4)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path $fleetCaptureResultPath) { break }
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  Start-Sleep -Seconds 2
+  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
+  Start-Sleep -Seconds 1
+  Save-StageLog "fleet-capture" | Out-Null
+
+  $fleetCapture = Get-Result "fleet-capture"
+  if ($fleetCapture -and $fleetCapture.passed) {
+    $capturedFleetPhases = @($fleetCapture.saved)
+    Write-Pass "captured fleet phases: $($capturedFleetPhases -join ', ')"
+  } else {
+    Write-Fail "fleet save/load capture"
+    Show-ScriptError "fleet-capture"
+  }
+}
+
 Write-Stage "Crop cycle save/load capture"
 Set-TestMode "cycle-capture"
 $cycleCaptureSave = Join-Path $RunRoot "cycle-capture.zip"
@@ -333,6 +371,22 @@ foreach ($phase in @("queue-working")) {
     Write-Pass "queue save/load ${phase}: active and waiting fields completed exactly"
   } else {
     Write-Fail "queue save/load $phase"
+    Show-ScriptError "saveload-$phase"
+  }
+}
+
+foreach ($phase in @("fleet-working")) {
+  if ($capturedFleetPhases -notcontains $phase) { Write-Fail "fleet save/load $phase (no save captured)"; continue }
+  $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*${phase}.zip" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $save) { Write-Fail "fleet save/load $phase (save file missing)"; continue }
+  Set-TestMode "fleet-replay"
+  Invoke-Factorio "saveload-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", "90000", "--benchmark-runs", "1") | Out-Null
+  $result = Get-Result "saveload-$phase"
+  if ($result -and $result.passed) {
+    Write-Pass "fleet save/load ${phase}: two working fields and one waiting field completed exactly"
+  } else {
+    Write-Fail "fleet save/load $phase"
     Show-ScriptError "saveload-$phase"
   }
 }
