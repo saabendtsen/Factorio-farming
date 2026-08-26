@@ -1049,6 +1049,12 @@ function slice.debug_replace_tractor(surface_index, position)
   return machine ~= nil, error_message
 end
 
+local function snapshot_lane_claim(work_field)
+  local claim = work_field and work_field.lane_claim
+  if not claim then return nil end
+  return {lane = claim.lane, job_id = claim.job_id, machine_id = claim.machine_id}
+end
+
 function slice.snapshot(surface_index)
   local root = ensure_root()
   local state = root.surfaces[surface_index]
@@ -1085,11 +1091,7 @@ function slice.snapshot(surface_index)
       machine_id = job.machine_id,
       has_claim = job.lane_claim ~= nil,
       claim_lane = job.lane_claim,
-      field_claim = work_field.lane_claim and {
-        lane = work_field.lane_claim.lane,
-        job_id = work_field.lane_claim.job_id,
-        machine_id = work_field.lane_claim.machine_id
-      } or nil,
+      field_claim = snapshot_lane_claim(work_field),
       generation = job.generation,
       failure = job.failure
     } or nil,
@@ -1136,11 +1138,7 @@ function slice.snapshot(surface_index)
             machine_id = queued.machine_id, failure = queued.failure,
             has_claim = queued.lane_claim ~= nil,
             claim_lane = queued.lane_claim,
-            field_claim = queued_field.lane_claim and {
-              lane = queued_field.lane_claim.lane,
-              job_id = queued_field.lane_claim.job_id,
-              machine_id = queued_field.lane_claim.machine_id
-            } or nil,
+            field_claim = snapshot_lane_claim(queued_field),
             recovered_completed_area = recovered_job_areas and recovered_job_areas[queued.id],
             completed_area = queued_field.completed_area, total_area = queued_field.area}
         end
