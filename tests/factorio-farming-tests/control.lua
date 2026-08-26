@@ -461,24 +461,36 @@ end
 -- Two tractors must take the two highest-priority distinct fields at once;
 -- the third field stays queued.  This is deliberately expressed only through
 -- the mod's debug setup/queue/snapshot seams, not storage internals.
-local function init_fleet()
-  local surface = build_surface("fleet")
+local FLEET_FIELD_AREA = 1024
+local FLEET_FIELD_SPECS = {
+  {bounds = {left = 160, top = 0, right = 224, bottom = 16}, priority = 20, label = "first"},
+  {bounds = {left = 240, top = 0, right = 304, bottom = 16}, priority = 10, label = "second"},
+  {bounds = {left = 80, top = 32, right = 144, bottom = 48}, priority = 5, label = "waiting"}
+}
+
+local function create_fleet_fixture(surface_name, error_prefix)
+  local surface = build_surface(surface_name)
   local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
     FIELD_BOUNDS, TRACTOR_POSITION, false)
-  truthy(ok, message or "fleet primary tractor setup failed")
+  truthy(ok, message or (error_prefix .. " primary tractor setup failed"))
   ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, {x = -20, y = 40})
-  truthy(ok, message or "fleet secondary tractor setup failed")
-  local queued, queue_error, first_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 160, top = 0, right = 224, bottom = 16}, 20, "cultivation")
-  truthy(queued, queue_error or "fleet first field queue failed")
-  queued, queue_error, storage.fleet_second_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 240, top = 0, right = 304, bottom = 16}, 10, "cultivation")
-  truthy(queued, queue_error or "fleet second field queue failed")
-  queued, queue_error, storage.fleet_waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 80, top = 32, right = 144, bottom = 48}, 5, "cultivation")
-  truthy(queued, queue_error or "fleet waiting field queue failed")
-  storage.fleet_surface = surface.index
-  storage.fleet_first_id = first_id
+  truthy(ok, message or (error_prefix .. " secondary tractor setup failed"))
+  local ids = {}
+  for index, spec in ipairs(FLEET_FIELD_SPECS) do
+    local queued, queue_error, field_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+      spec.bounds, spec.priority, "cultivation")
+    truthy(queued, queue_error or (error_prefix .. " " .. spec.label .. " field queue failed"))
+    ids[index] = field_id
+  end
+  return {surface = surface.index, first_id = ids[1], second_id = ids[2], waiting_id = ids[3]}
+end
+
+local function init_fleet()
+  local fixture = create_fleet_fixture("fleet", "fleet")
+  storage.fleet_surface = fixture.surface
+  storage.fleet_first_id = fixture.first_id
+  storage.fleet_second_id = fixture.second_id
+  storage.fleet_waiting_id = fixture.waiting_id
   storage.fleet_initial_dispatch_seen = false
   storage.fleet_concurrent_work_seen = false
   storage.fleet_deadline = game.tick + 29999
@@ -519,8 +531,6 @@ end
 -- tractors each working a distinct field, plus a third field still waiting for
 -- capacity.  Only the public debug setup/queue/snapshot seams are used, so the
 -- acceptance stays valid when scheduler storage is refactored.
-local FLEET_FIELD_AREA = 1024
-
 local function machine_entry(snap, machine_id)
   for _, machine in ipairs(snap.machines or {}) do
     if machine.id == machine_id then return machine end
@@ -533,6 +543,8 @@ end
 -- it, and coverage never exceeds or rewinds authoritative area.
 local function check_fleet_invariants(snap, jobs, seen_areas, label)
   local claimed_by = {}
+  local machines_by_id = {}
+  for _, machine in ipairs(snap.machines or {}) do machines_by_id[machine.id] = machine end
   for _, job in ipairs(jobs) do
     equal(job.total_area, FLEET_FIELD_AREA,
       label .. " field " .. tostring(job.id) .. " is not a 64x16 field")
@@ -545,6 +557,13 @@ local function check_fleet_invariants(snap, jobs, seen_areas, label)
       truthy(not claimed_by[job.machine_id],
         label .. " dispatched tractor " .. tostring(job.machine_id) .. " to two fields at once")
       claimed_by[job.machine_id] = job.id
+      local machine = machines_by_id[job.machine_id]
+      truthy(machine, label .. " job " .. tostring(job.id) .. " references a missing tractor")
+      equal(machine.job_id, job.id,
+        label .. " job " .. tostring(job.id) .. " is not claimed back by its tractor")
+      truthy(job.has_claim, label .. " assigned job " .. tostring(job.id) .. " has no lane claim")
+    else
+      truthy(not job.has_claim, label .. " unassigned job " .. tostring(job.id) .. " retained a lane claim")
     end
   end
   for _, machine in ipairs(snap.machines or {}) do
@@ -556,30 +575,12 @@ local function check_fleet_invariants(snap, jobs, seen_areas, label)
 end
 
 local function init_fleet_capture()
-  local surface = build_surface("fleet-capture")
-  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
-    FIELD_BOUNDS, TRACTOR_POSITION, false)
-  truthy(ok, message or "fleet save capture primary tractor setup failed")
-  ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, {x = -20, y = 40})
-  truthy(ok, message or "fleet save capture secondary tractor setup failed")
-
-  local queued, queue_error, first_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 160, top = 0, right = 224, bottom = 16}, 20, "cultivation")
-  truthy(queued, queue_error or "fleet save capture first field failed")
-  local second_id
-  queued, queue_error, second_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 240, top = 0, right = 304, bottom = 16}, 10, "cultivation")
-  truthy(queued, queue_error or "fleet save capture second field failed")
-  local waiting_id
-  queued, queue_error, waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
-    {left = 80, top = 32, right = 144, bottom = 48}, 5, "cultivation")
-  truthy(queued, queue_error or "fleet save capture waiting field failed")
-
+  local fixture = create_fleet_fixture("fleet-capture", "fleet save capture")
   storage.fleet_capture = {
-    surface = surface.index,
-    first_id = first_id,
-    second_id = second_id,
-    waiting_id = waiting_id,
+    surface = fixture.surface,
+    first_id = fixture.first_id,
+    second_id = fixture.second_id,
+    waiting_id = fixture.waiting_id,
     areas = {},
     deadline = game.tick + 30000
   }
@@ -616,6 +617,9 @@ local function drive_fleet_capture(event)
       waiting_id = waiting.id,
       first_machine_id = first.machine_id,
       second_machine_id = second.machine_id,
+      first_field_id = first.field_id,
+      second_field_id = second.field_id,
+      waiting_field_id = waiting.field_id,
       first_area = first.completed_area,
       second_area = second.completed_area,
       waiting_area = waiting.completed_area,
@@ -650,6 +654,9 @@ local function drive_fleet_verify(event)
     equal(second.state, "working", "second fleet field did not remain working after load")
     equal(first.machine_id, saved.first_machine_id, "first fleet field changed tractor across load")
     equal(second.machine_id, saved.second_machine_id, "second fleet field changed tractor across load")
+    equal(first.field_id, saved.first_field_id, "first fleet job changed field across load")
+    equal(second.field_id, saved.second_field_id, "second fleet job changed field across load")
+    equal(waiting.field_id, saved.waiting_field_id, "waiting fleet job changed field across load")
     equal(first.recovered_completed_area, saved.first_area,
       "fleet load changed first authoritative coverage before work resumed")
     equal(second.recovered_completed_area, saved.second_area,
@@ -692,6 +699,10 @@ local function drive_fleet_verify(event)
   equal(first.completed_area, FLEET_FIELD_AREA, "first fleet field is not 1024/1024 after load")
   equal(second.completed_area, FLEET_FIELD_AREA, "second fleet field is not 1024/1024 after load")
   equal(waiting.completed_area, FLEET_FIELD_AREA, "waiting fleet field is not 1024/1024 after load")
+  for _, job in ipairs({first, second, waiting}) do
+    equal(job.machine_id, nil, "completed fleet job retained a tractor assignment")
+    truthy(not job.has_claim, "completed fleet job retained a lane claim")
+  end
   equal(first.failure, nil, "first fleet field failed after load")
   equal(second.failure, nil, "second fleet field failed after load")
   equal(waiting.failure, nil, "waiting fleet field failed instead of dispatching after load")
@@ -1427,54 +1438,43 @@ end
 
 -- ----------------------------------------------------------------- dispatch
 
+local initializers = {
+  capture = init_capture,
+  ["cycle-capture"] = init_cycle_capture,
+  cycle = init_cycle,
+  functional = init_functional,
+  queue = init_queue,
+  fleet = init_fleet,
+  ["queue-capture"] = init_queue_capture,
+  ["fleet-capture"] = init_fleet_capture
+}
+
+local drivers = {
+  capture = drive_capture,
+  ["cycle-capture"] = drive_cycle_capture,
+  cycle = drive_cycle,
+  replay = drive_replay,
+  functional = drive_functional,
+  queue = drive_queue,
+  fleet = drive_fleet,
+  ["queue-capture"] = drive_queue_capture,
+  ["queue-replay"] = drive_queue_verify,
+  ["fleet-capture"] = drive_fleet_capture,
+  ["fleet-replay"] = drive_fleet_verify
+}
+
 script.on_init(function()
   run_pure_tests()
   run_storage_prototype_tests()
   run_storage_placement_tests()
   run_contextual_action_tests()
-  if mode == "capture" then
-    init_capture()
-  elseif mode == "cycle-capture" then
-    init_cycle_capture()
-  elseif mode == "cycle" then
-    init_cycle()
-  elseif mode == "functional" then
-    init_functional()
-  elseif mode == "queue" then
-    init_queue()
-  elseif mode == "fleet" then
-    init_fleet()
-  elseif mode == "queue-capture" then
-    init_queue_capture()
-  elseif mode == "fleet-capture" then
-    init_fleet_capture()
-  else
-    fail("mode '" .. tostring(mode) .. "' does not create a map")
-  end
+  local initialize = initializers[mode]
+  if not initialize then fail("mode '" .. tostring(mode) .. "' does not create a map") end
+  initialize()
 end)
 
 script.on_event(defines.events.on_tick, function(event)
-  if mode == "capture" then
-    drive_capture(event)
-  elseif mode == "cycle-capture" then
-    drive_cycle_capture(event)
-  elseif mode == "cycle" then
-    drive_cycle(event)
-  elseif mode == "replay" then
-    drive_replay(event)
-  elseif mode == "queue" then
-    drive_queue(event)
-  elseif mode == "fleet" then
-    drive_fleet(event)
-  elseif mode == "queue-capture" then
-    drive_queue_capture(event)
-  elseif mode == "queue-replay" then
-    drive_queue_verify(event)
-  elseif mode == "fleet-capture" then
-    drive_fleet_capture(event)
-  elseif mode == "fleet-replay" then
-    drive_fleet_verify(event)
-  else
-    drive_functional(event)
-  end
+  local drive = drivers[mode]
+  if not drive then fail("mode '" .. tostring(mode) .. "' has no tick driver") end
+  drive(event)
 end)
