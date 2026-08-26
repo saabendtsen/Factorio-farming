@@ -625,6 +625,63 @@ local function run_contextual_action_tests()
   equal(status.next_field_operation, "cultivation", "contextual status exposes exactly the next valid field operation")
 end
 
+-- ------------------------------------------------------------ storage entity
+
+-- The storage container must be a real entity a player can obtain and place.
+-- It mines back to its own item, that item places it again, and one simple
+-- always-available recipe supplies it without debug commands. Discovery still
+-- matches vanilla containers, so nearby chests remain valid storage containers.
+local function run_storage_prototype_tests()
+  local entity_prototype = prototypes.entity["farming-storage-container"]
+  truthy(entity_prototype, "farming storage entity prototype exists")
+  equal(entity_prototype.type, "container", "farming storage stays a container for harvest discovery")
+
+  local mineable = entity_prototype.mineable_properties
+  truthy(mineable.minable, "farming storage is minable")
+  equal(#mineable.products, 1, "farming storage mines to exactly one product")
+  equal(mineable.products[1].name, "farming-storage-container", "farming storage mines to its own item")
+
+  local item_prototype = prototypes.item["farming-storage-container"]
+  truthy(item_prototype, "farming storage item prototype exists")
+  truthy(item_prototype.place_result, "farming storage item places an entity")
+  equal(item_prototype.place_result.name, "farming-storage-container",
+    "farming storage item places the farming storage entity")
+
+  local recipe = game.forces.player.recipes["farming-storage-container"]
+  truthy(recipe, "farming storage recipe exists")
+  truthy(recipe.enabled, "farming storage recipe is available without debug commands")
+  local recipe_categories = prototypes.recipe["farming-storage-container"].categories
+  truthy(recipe_categories["crafting"] or recipe_categories[1] == "crafting",
+    "farming storage recipe is hand-craftable")
+  truthy(#recipe.ingredients > 0, "farming storage recipe consumes ingredients")
+  equal(#recipe.products, 1, "farming storage recipe yields exactly one product")
+  equal(recipe.products[1].name, "farming-storage-container",
+    "farming storage recipe yields the farming storage item")
+
+  local steel_chest_mineable_properties = prototypes.entity["steel-chest"].mineable_properties
+  equal(steel_chest_mineable_properties.products[1].name, "steel-chest",
+    "vanilla steel chest keeps its own mining product")
+end
+
+local function run_storage_placement_tests()
+  local surface = build_surface("storage-placement")
+  local placed = surface.create_entity({
+    name = "farming-storage-container", position = {x = -8, y = 20}, force = game.forces.player
+  })
+  truthy(placed, "farming storage entity can be placed")
+  local vanilla = surface.create_entity({
+    name = "steel-chest", position = {x = -4, y = 20}, force = game.forces.player
+  })
+  truthy(vanilla, "nearby vanilla container can be placed")
+
+  local containers = surface.find_entities_filtered({type = "container", area = {{-16, 12}, {0, 28}}})
+  equal(#containers, 2, "storage container discovery still matches vanilla containers")
+
+  local inventory = placed.get_inventory(defines.inventory.chest)
+  truthy(inventory, "farming storage exposes a chest inventory")
+  truthy(inventory.can_insert({name = "farming-wheat", count = 1}), "farming storage accepts harvested wheat")
+end
+
 -- ---------------------------------------------------------------- functional
 
 local function init_functional()
@@ -787,7 +844,7 @@ local function drive_cycle(event)
         storage.cycle_storage_full_wheat, "full destination accepts no partial wheat")
       storage.cycle_storage.destroy()
       storage.cycle_storage = game.get_surface(storage.cycle_surface).create_entity({
-        name = "farming-storage-container", position = {x = -10, y = 20}, force = game.forces.player
+        name = "steel-chest", position = {x = -10, y = 20}, force = game.forces.player
       })
       truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume after full storage replacement")
       storage.cycle_storage_full_retried = true
@@ -797,7 +854,7 @@ local function drive_cycle(event)
       equal(snap.field.harvested_area, 0, "missing destination changes no harvest coverage")
       equal(snap.field.sown_area, 1024, "missing destination retains ready crop coverage")
       storage.cycle_storage = game.get_surface(storage.cycle_surface).create_entity({
-        name = "farming-storage-container", position = {x = -10, y = 20}, force = game.forces.player
+        name = "steel-chest", position = {x = -10, y = 20}, force = game.forces.player
       })
       truthy(remote.call("factorio_farming", "debug_resume", storage.cycle_surface), "resume after storage replacement")
       storage.cycle_storage_retried = true
@@ -868,6 +925,20 @@ local function drive_cycle(event)
     storage.cycle_operation = "growing"
   elseif storage.cycle_operation == "growing" then
     if snap.field.lifecycle == "ready" then
+      local mod_storage_status = remote.call("factorio_farming", "contextual_status", storage.cycle_surface)
+      equal(mod_storage_status.storage.state, "eligible",
+        "ready field identifies the farming storage container")
+      equal(mod_storage_status.storage.unit_number, storage.cycle_storage.unit_number,
+        "ready field identifies the eligible farming storage container")
+      storage.cycle_storage.destroy()
+      storage.cycle_storage = game.get_surface(storage.cycle_surface).create_entity({
+        name = "steel-chest", position = {x = -10, y = 20}, force = game.forces.player
+      })
+      local vanilla_storage_status = remote.call("factorio_farming", "contextual_status", storage.cycle_surface)
+      equal(vanilla_storage_status.storage.state, "eligible",
+        "ready field identifies an eligible vanilla storage container")
+      equal(vanilla_storage_status.storage.unit_number, storage.cycle_storage.unit_number,
+        "ready field identifies the nearby vanilla storage container")
       local inventory = storage.cycle_storage.get_inventory(defines.inventory.chest)
       storage.cycle_storage_full_wheat = inventory.insert({name = "farming-wheat", count = 10000000})
       truthy(not inventory.can_insert({name = "farming-wheat", count = 1}), "crop cycle storage is full")
@@ -876,12 +947,12 @@ local function drive_cycle(event)
       equal(ready_status.next_field_operation, "harvesting", "ready field exposes harvesting as its next field operation")
       equal(ready_status.storage.state, "eligible", "ready field identifies an eligible storage container")
       equal(ready_status.storage.unit_number, storage.cycle_storage.unit_number,
-        "ready field identifies the eligible storage container")
+        "ready field identifies the eligible vanilla storage container")
       truthy(remote.call("factorio_farming", "debug_start_next_operation", storage.cycle_surface), "crop cycle harvest start")
       local contextual_status = remote.call("factorio_farming", "contextual_status", storage.cycle_surface)
       equal(contextual_status.storage.state, "designated", "harvest contextual status identifies its storage container")
       equal(contextual_status.storage.unit_number, storage.cycle_storage.unit_number,
-        "harvest contextual status identifies the designated storage container")
+        "harvest contextual status designates the vanilla storage container")
       storage.cycle_operation = "harvesting"
     end
   elseif snap.job.state == "completed" and storage.cycle_operation == "harvesting" then
@@ -890,7 +961,7 @@ local function drive_cycle(event)
     equal(snap.field.harvested_area, 1024, "crop cycle harvest coverage")
     equal(snap.field.sown_area, 0, "crop cycle removes harvested sowing coverage")
     equal(storage.cycle_storage.get_inventory(defines.inventory.chest).get_item_count("farming-wheat"), 1024,
-      "crop cycle deposits one wheat per tile")
+      "crop cycle deposits one wheat per tile into a vanilla storage container")
     write_result("cycle", {passed = true, completed_area = snap.field.cultivated_area, wheat = 1024})
     script.on_event(defines.events.on_tick, nil)
   end
@@ -1159,6 +1230,8 @@ end
 
 script.on_init(function()
   run_pure_tests()
+  run_storage_prototype_tests()
+  run_storage_placement_tests()
   run_contextual_action_tests()
   if mode == "capture" then
     init_capture()
