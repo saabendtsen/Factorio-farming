@@ -89,11 +89,11 @@ local function enable_setup_shortcut(player)
   if player and player.valid then player.set_shortcut_available("farming-setup", true) end
 end
 
-local function create_machine(surface, force, position)
+local function create_machine(surface, force, position, additional)
   local root = ensure_root()
   local state = surface_state(surface.index)
   local existing = state.machine
-  if existing and movement.entity(existing) then return existing end
+  if not additional and existing and movement.entity(existing) then return existing end
 
   local spawn = surface.find_non_colliding_position("farming-tractor", position, 16, 0.5)
   if not spawn then return nil, "No safe position was found for the farming tractor." end
@@ -120,12 +120,21 @@ local function create_machine(surface, force, position)
     controller = {state = "idle", recoveries = 0}
   }
   root.next_machine_id = root.next_machine_id + 1
-  state.machine = machine
+  if not state.machine or not movement.entity(state.machine) then state.machine = machine end
   root.machines[machine.id] = machine
   add_surface_identity(state, "machine_ids", machine.id)
   local registration = script.register_on_object_destroyed(entity)
-  root.destroy_registrations[registration] = surface.index
+  root.destroy_registrations[registration] = {surface_index = surface.index, machine_id = machine.id}
   return machine
+end
+
+-- Controllers operate on this projection, while `state.*` remains the
+-- compatibility alias for the original player-facing single field.
+local function assignment_state(root, machine)
+  local job = machine and machine.job_id and root.jobs[machine.job_id]
+  local work_field = job and root.fields[job.field_id]
+  if not job or not work_field then return nil end
+  return {machine = machine, job = job, field = work_field}
 end
 
 local function lane_target(work_field)
@@ -184,16 +193,13 @@ end
 -- flight. Travel starts on the following controller tick so the state is a real,
 -- observable, save-able phase rather than a transient step inside setup.
 local function promote_reserved(root)
-  local indexes = {}
-  for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
-  table.sort(indexes)
-  for _, index in ipairs(indexes) do
-    local state = root.surfaces[index]
-    local job = state.job
-    local machine = state.machine
-    if job and machine and job.state == "reserved" and movement.entity(machine) then
-      begin_travel(state)
-    end
+  local machine_ids = {}
+  for machine_id in pairs(root.machines) do machine_ids[#machine_ids + 1] = machine_id end
+  table.sort(machine_ids)
+  for _, machine_id in ipairs(machine_ids) do
+    local machine = root.machines[machine_id]
+    local state = assignment_state(root, machine)
+    if state and state.job.state == "reserved" and movement.entity(machine) then begin_travel(state) end
   end
 end
 
@@ -255,23 +261,29 @@ local function finite_number(value, fallback)
   return number
 end
 
--- A single compatible idle tractor takes exactly one queued job.  Assigning
--- the collection records to the established surface aliases lets the existing
--- movement and recovery controller remain the sole authority for field work.
+-- Every compatible idle tractor independently takes one queued field.  The
+-- original aliases remain untouched so player APIs still address their field.
 local function dispatch_queued_jobs(root)
   local indexes = {}
   for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
   table.sort(indexes)
   for _, index in ipairs(indexes) do
     local state = root.surfaces[index]
-    local machine = state.machine
-    if machine and machine.job_id == nil and movement.entity(machine) then
-      for _, job in ipairs(queued_candidates(root, index)) do
-        local work_field = root.fields[job.field_id]
-        if operation_implement(machine, job.operation) then
-          state.field = work_field
-          state.job = job
-          if reserve_job(state) then break end
+    local machine_ids = state.machine_ids or {}
+    table.sort(machine_ids)
+    for _, machine_id in ipairs(machine_ids) do
+      local machine = root.machines[machine_id]
+      if machine and machine.job_id == nil and movement.entity(machine) then
+        for _, job in ipairs(queued_candidates(root, index)) do
+          local work_field = root.fields[job.field_id]
+          local assignment = {machine = machine, job = job, field = work_field}
+          if operation_implement(machine, job.operation) and reserve_job(assignment) then
+            if machine.id == (state.machine and state.machine.id) then
+              state.field = work_field
+              state.job = job
+            end
+            break
+          end
         end
       end
     end
@@ -434,14 +446,10 @@ local function recover_loaded_state()
   root.pending_paths = {}
   root.outstanding_path_id = nil
 
-  local indexes = {}
-  for index in pairs(root.surfaces) do indexes[#indexes + 1] = index end
-  table.sort(indexes)
-  for _, index in ipairs(indexes) do
-    local state = root.surfaces[index]
-    local job = state.job
-    local machine = state.machine
-    if job and machine and job.state ~= "completed" then
+  for _, machine in pairs(root.machines) do
+    local state = assignment_state(root, machine)
+    local job = state and state.job
+    if state and job.state ~= "completed" then
       if not movement.entity(machine) then
         if job.state ~= "failed" then
           fail_job(state, "The assigned tractor was missing after loading. Progress has been preserved.")
@@ -468,8 +476,8 @@ local function recover_loaded_state()
         end
       end
     end
-    if state.field then visuals.mark_dirty(state.field) end
   end
+  for _, work_field in pairs(root.fields) do visuals.mark_dirty(work_field) end
 end
 
 function slice.show_setup_hint(player)
@@ -875,9 +883,10 @@ end
 function slice.on_path_finished(event)
   local outcome = movement.on_path_finished(event)
   if not outcome then return end
-  for _, state in pairs(ensure_root().surfaces) do
-    if state.machine and state.machine.id == outcome.machine_id then handle_outcome(state, outcome); return end
-  end
+  local root = ensure_root()
+  local machine = root.machines[outcome.machine_id]
+  local state = assignment_state(root, machine)
+  if state then handle_outcome(state, outcome) end
 end
 
 local function tick_body(event)
@@ -886,20 +895,19 @@ local function tick_body(event)
   dispatch_queued_jobs(root)
   promote_reserved(root)
   movement.process_path_queue(event.tick)
-  local surface_indexes = {}
-  for index in pairs(root.surfaces) do surface_indexes[#surface_indexes + 1] = index end
-  table.sort(surface_indexes)
   local due = {}
   local active = 0
-  for _, index in ipairs(surface_indexes) do
-    local state = root.surfaces[index]
-    if state.field and state.field.next_growth_visual_tick and event.tick >= state.field.next_growth_visual_tick then
-      visuals.mark_dirty(state.field)
-      state.field.next_growth_visual_tick = field_module.next_growth_tick(state.field, event.tick)
+  for _, work_field in pairs(root.fields) do
+    if work_field.next_growth_visual_tick and event.tick >= work_field.next_growth_visual_tick then
+      visuals.mark_dirty(work_field)
+      work_field.next_growth_visual_tick = field_module.next_growth_tick(work_field, event.tick)
     end
-    if state.machine and state.job and state.job.state ~= "paused" and state.job.state ~= "failed" and state.job.state ~= "completed" then
+  end
+  for _, machine in pairs(root.machines) do
+    local state = assignment_state(root, machine)
+    if state and state.job.state ~= "paused" and state.job.state ~= "failed" and state.job.state ~= "completed" then
       active = active + 1
-      if (event.tick + state.machine.id) % movement.constants.cadence == 0 then
+      if (event.tick + machine.id) % movement.constants.cadence == 0 then
         due[#due + 1] = state
       end
     end
@@ -917,8 +925,9 @@ local function tick_body(event)
     handle_outcome(selected, movement.update(selected.machine, event.tick))
     finish_arrived_harvest_lane(selected)
   end
-  for _, index in ipairs(surface_indexes) do
-    finish_arrived_harvest_lane(root.surfaces[index])
+  for _, machine in pairs(root.machines) do
+    local state = assignment_state(root, machine)
+    if state then finish_arrived_harvest_lane(state) end
   end
   visuals.update()
   return active
@@ -952,13 +961,21 @@ end
 
 function slice.on_object_destroyed(event)
   local root = ensure_root()
-  local surface_index = root.destroy_registrations[event.registration_number]
-  if not surface_index then return end
+  local registration = root.destroy_registrations[event.registration_number]
+  if not registration then return end
   root.destroy_registrations[event.registration_number] = nil
-  local state = root.surfaces[surface_index]
-  if state and state.machine and state.machine.unit_number == event.useful_id then
-    fail_job(state, "The assigned tractor was destroyed. Progress has been preserved.")
+  -- v3.1 registrations identify the machine; v3.0 saves stored only the
+  -- surface index, so preserve the original replacement/resume behavior.
+  if type(registration) == "number" then
+    local legacy_state = root.surfaces[registration]
+    if legacy_state and legacy_state.machine and legacy_state.machine.unit_number == event.useful_id then
+      fail_job(legacy_state, "The assigned tractor was destroyed. Progress has been preserved.")
+    end
+    return
   end
+  local machine = root.machines[registration.machine_id]
+  local state = assignment_state(root, machine)
+  if state and machine.unit_number == event.useful_id then fail_job(state, "The assigned tractor was destroyed. Progress has been preserved.") end
 end
 
 function slice.debug_setup(surface_index, bounds, tractor_position, start_operation)
@@ -1076,6 +1093,19 @@ function slice.snapshot(surface_index)
       speed = movement.entity(machine) and movement.entity(machine).speed or nil,
       orientation = movement.entity(machine) and movement.entity(machine).orientation or nil
     } or nil,
+    machines = (function()
+      local result = {}
+      for _, machine_id in ipairs(state.machine_ids or {}) do
+        local fleet_machine = root.machines[machine_id]
+        if fleet_machine then
+          result[#result + 1] = {id = fleet_machine.id, unit_number = fleet_machine.unit_number,
+            valid = movement.entity(fleet_machine) ~= nil, job_id = fleet_machine.job_id,
+            controller_state = fleet_machine.controller and fleet_machine.controller.state}
+        end
+      end
+      table.sort(result, function(a, b) return a.id < b.id end)
+      return result
+    end)(),
     pending_path_count = ensure_root().outstanding_path_id and 1 or 0,
     visual_count = work_field and visuals.object_count(work_field.id) or 0,
     queued_jobs = (function()
@@ -1094,6 +1124,12 @@ function slice.snapshot(surface_index)
       return result
     end)()
   }
+end
+
+function slice.debug_add_tractor(surface_index, position)
+  local surface = game.get_surface(surface_index)
+  local machine, error_message = create_machine(surface, game.forces.player, position, true)
+  return machine ~= nil, error_message, machine and machine.id
 end
 
 function slice.clear_visuals(surface_index)

@@ -156,6 +156,18 @@ else {
   }
 }
 
+Write-Stage "Two-tractor fleet dispatch acceptance flow"
+Set-TestMode "fleet"
+$fleetSave = Join-Path $RunRoot "fleet-test.zip"
+Invoke-Factorio "fleet-create" @("--create", $fleetSave) | Out-Null
+if (-not (Test-Path $fleetSave)) { Write-Fail "fleet map creation" }
+else {
+  Invoke-Factorio "fleet" @("--benchmark", $fleetSave, "--benchmark-ticks", "30000", "--benchmark-runs", "1") | Out-Null
+  $fleet = Get-Result "fleet"
+  if ($fleet -and $fleet.passed) { Write-Pass "two-tractor fleet: distinct priority fields dispatched concurrently" }
+  else { Write-Fail "two-tractor fleet dispatch"; Show-ScriptError "fleet" }
+}
+
 Write-Stage "Shared queue save/load capture"
 Set-TestMode "queue-capture"
 $queueCaptureSave = Join-Path $RunRoot "queue-capture.zip"

@@ -458,6 +458,61 @@ local function drive_queue(event)
   end
 end
 
+-- Two tractors must take the two highest-priority distinct fields at once;
+-- the third field stays queued.  This is deliberately expressed only through
+-- the mod's debug setup/queue/snapshot seams, not storage internals.
+local function init_fleet()
+  local surface = build_surface("fleet")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "fleet primary tractor setup failed")
+  ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, {x = -20, y = 40})
+  truthy(ok, message or "fleet secondary tractor setup failed")
+  local queued, queue_error, first_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 20, "cultivation")
+  truthy(queued, queue_error or "fleet first field queue failed")
+  queued, queue_error, storage.fleet_second_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "fleet second field queue failed")
+  queued, queue_error, storage.fleet_waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 32, right = 144, bottom = 48}, 5, "cultivation")
+  truthy(queued, queue_error or "fleet waiting field queue failed")
+  storage.fleet_surface = surface.index
+  storage.fleet_first_id = first_id
+  storage.fleet_initial_dispatch_seen = false
+  storage.fleet_concurrent_work_seen = false
+  storage.fleet_deadline = game.tick + 29999
+end
+
+local function drive_fleet(event)
+  local snap = snapshot(storage.fleet_surface)
+  local first = queued_job(snap, storage.fleet_first_id)
+  local second = queued_job(snap, storage.fleet_second_id)
+  local waiting = queued_job(snap, storage.fleet_waiting_id)
+  truthy(first and second and waiting, "fleet jobs remain visible")
+  if not storage.fleet_initial_dispatch_seen and first.machine_id and second.machine_id then
+    truthy(first.machine_id ~= second.machine_id, "two tractors receive distinct field jobs")
+    equal(waiting.state, "waiting", "third-priority field remains queued")
+    equal(waiting.machine_id, nil, "third-priority field remains unassigned")
+    truthy(#(snap.machines or {}) == 2, "fleet snapshot exposes both tractors")
+    storage.fleet_initial_dispatch_seen = true
+  end
+  if first.state == "working" and second.state == "working" then
+    storage.fleet_concurrent_work_seen = true
+  end
+  if storage.fleet_initial_dispatch_seen and storage.fleet_concurrent_work_seen and
+     first.state == "completed" and second.state == "completed" and waiting.machine_id then
+    equal(first.completed_area, 1024, "first fleet field completes exact coverage")
+    equal(second.completed_area, 1024, "second fleet field completes exact coverage")
+    write_result("fleet", {passed = true, first_id = first.id, second_id = second.id, waiting_id = waiting.id,
+      machine_ids = {first.machine_id, second.machine_id}, third_machine_id = waiting.machine_id})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= storage.fleet_deadline then
+    write_result("fleet", {passed = false, snapshot = snap})
+    fail("two-tractor dispatch timeout")
+  end
+end
+
 -- ---------------------------------------------------------------- queue save/load
 
 -- A queue save must contain both sides of the scheduler boundary: an assigned
@@ -1115,6 +1170,8 @@ script.on_init(function()
     init_functional()
   elseif mode == "queue" then
     init_queue()
+  elseif mode == "fleet" then
+    init_fleet()
   elseif mode == "queue-capture" then
     init_queue_capture()
   else
@@ -1133,6 +1190,8 @@ script.on_event(defines.events.on_tick, function(event)
     drive_replay(event)
   elseif mode == "queue" then
     drive_queue(event)
+  elseif mode == "fleet" then
+    drive_fleet(event)
   elseif mode == "queue-capture" then
     drive_queue_capture(event)
   elseif mode == "queue-replay" then

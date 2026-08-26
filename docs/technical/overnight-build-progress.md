@@ -18,8 +18,8 @@ It is updated only after a milestone has passed its stated verification gate.
 | Player-facing setup and placeholder machinery visuals | Complete | Ctrl+F and toolbar shortcut, onboarding, cursor-safe planner handling, placeholder tractor identity; `tests/run-factorio-tests.ps1 -SkipBenchmark` passed all functional, crop, capture, and replay stages |
 | Multi-field scheduler design review | Complete | Independent architecture and test reviews selected schema v3 collections, deterministic dispatch ordering, and staged fleet acceptance |
 | Shared queue, priorities, and single-tractor scheduling | Complete | Fresh clean-arena acceptance passed deterministic priority dispatch, pause/resume, exact coverage, tractor-loss failure without requeue, plus invalid-operation and overlap rejection |
-| Queue save/load acceptance | In progress | Final Spec review requires queued waiting and assigned/working jobs to survive load before the scheduler foundation is called fully validated |
-| Multi-field fleet scheduling | Planned | Two tractors on one surface, separate fields only: durable machine-to-job-to-field assignments; deterministic priority dispatch; no same-field parallel lanes or cross-surface arbitration |
+| Queue save/load acceptance | Complete | Working and waiting queued fields preserve identity and authoritative coverage through save/load, then complete exactly; targeted isolated capture/replay passed |
+| Multi-field fleet scheduling | In progress | Durable machine-to-job-to-field controller assignments dispatch two tractors concurrently over separate fields; lower-priority field waits then releases after an idle tractor. Fleet save/load and per-tractor destruction remain the next gates |
 | Independent standards/spec review | Complete with gate | Standards: no hard findings. Spec: queue-specific save/load acceptance is required before fleet implementation starts |
 
 ## Two-tractor acceptance seams
