@@ -37,6 +37,8 @@ remote.add_interface("factorio_farming", {
   debug_queue_field = slice.debug_queue_field,
   contextual_status = slice.contextual_status,
   debug_destroy_tractor = slice.debug_destroy_tractor,
+  debug_destroy_tractor_by_id = slice.debug_destroy_tractor_by_id,
+  debug_retry_queued_field_job = slice.debug_retry_queued_field_job,
   debug_replace_tractor = slice.debug_replace_tractor,
   debug_add_tractor = slice.debug_add_tractor,
   debug_seed_crop_stage = slice.debug_seed_crop_stage,
