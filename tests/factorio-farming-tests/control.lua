@@ -486,7 +486,8 @@ local function drive_queue(event)
       truthy(remote.call("factorio_farming", "debug_mark_visuals_dirty", storage.queue_surface, paused.field_id),
         "growing field could not be re-marked dirty")
       if high_visual and paused_visual and high_visual.projection and paused_visual.projection and
-         high_visual.projection.crop.sown > 0 and paused_visual.projection.crop.growing > 0 then
+         high_visual.projection.rectangle_counts.crop_growth.sown > 0 and
+         paused_visual.projection.rectangle_counts.crop_growth.growing > 0 then
         storage.queue_visual_progress_tick = storage.queue_visual_progress_tick or event.tick
       end
       truthy(event.tick < storage.queue_visual_deadline,
@@ -520,9 +521,11 @@ local function drive_queue(event)
       "completed non-selected field does not project its operation coverage")
     truthy(by_field[paused.field_id] and by_field[paused.field_id].count > 3,
       "resumed non-selected field does not project its operation coverage")
-    truthy(high_visual.projection.crop.sown > 0 and high_visual.projection.crop.growing == 0,
+    local high_crop = high_visual.projection.rectangle_counts.crop_growth
+    local paused_crop = paused_visual.projection.rectangle_counts.crop_growth
+    truthy(high_crop.sown > 0 and high_crop.growing == 0,
       "sown non-selected field does not expose its crop growth stage")
-    truthy(paused_visual.projection.crop.growing > 0 and paused_visual.projection.crop.sown == 0,
+    truthy(paused_crop.growing > 0 and paused_crop.sown == 0,
       "growing non-selected field does not expose its crop growth stage")
     equal(by_field[failed.field_id] and by_field[failed.field_id].count, 3,
       "unstarted field projects coverage it never completed")

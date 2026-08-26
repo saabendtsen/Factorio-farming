@@ -106,10 +106,12 @@ local function build_specs(work_field)
       right = work_field.entrance.x + 0.5, bottom = work_field.entrance.y + 0.5
     }, {0.2, 0.65, 1, 0.8}, true)
   }
-  local summary = {base = 3, operation = 0, crop = {sown = 0, growing = 0, ready = 0}}
+  local summary = {rectangle_counts = {
+    base = 3, field_operation = 0, crop_growth = {sown = 0, growing = 0, ready = 0}
+  }}
   for _, rectangle in ipairs(field_module.completed_rectangles(work_field)) do
     specs[#specs + 1] = rectangle_spec(rectangle, {0.45, 0.24, 0.08, 0.6}, true)
-    summary.operation = summary.operation + 1
+    summary.rectangle_counts.field_operation = summary.rectangle_counts.field_operation + 1
   end
   local crop_colors = {
     sown = {0.72, 0.58, 0.20, 0.45},
@@ -120,10 +122,10 @@ local function build_specs(work_field)
     local stage = field_module.crop_stage(crop, game.tick)
     for _, rectangle in ipairs(field_module.crop_rectangles(work_field, crop)) do
       specs[#specs + 1] = rectangle_spec(rectangle, crop_colors[stage], true)
-      summary.crop[stage] = summary.crop[stage] + 1
+      summary.rectangle_counts.crop_growth[stage] = summary.rectangle_counts.crop_growth[stage] + 1
     end
   end
-  summary.total = #specs
+  summary.rectangle_counts.total = #specs
   return specs, summary
 end
 
@@ -236,11 +238,15 @@ end
 function visuals.summary(field_id)
   local summary = root().visual_summaries[field_id]
   if not summary then return nil end
+  local counts = summary.rectangle_counts
   return {
-    base = summary.base,
-    operation = summary.operation,
-    total = summary.total,
-    crop = {sown = summary.crop.sown, growing = summary.crop.growing, ready = summary.crop.ready}
+    rectangle_counts = {
+      base = counts.base,
+      field_operation = counts.field_operation,
+      total = counts.total,
+      crop_growth = {sown = counts.crop_growth.sown, growing = counts.crop_growth.growing,
+        ready = counts.crop_growth.ready}
+    }
   }
 end
 
