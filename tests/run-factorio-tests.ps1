@@ -106,6 +106,37 @@ function Show-ScriptError($stage) {
   }
 }
 
+function Invoke-RealtimeCapture($stage, [int]$deadlineMinutes) {
+  Set-TestMode $stage
+  $save = Join-Path $RunRoot "$stage.zip"
+  Invoke-Factorio "$stage-create" @("--create", $save) | Out-Null
+  if (-not (Test-Path $save)) {
+    return [pscustomobject]@{ SaveCreated = $false; Result = $null }
+  }
+
+  # A headless server is the only mode that honours game.auto_save; --benchmark
+  # silently ignores it. The run is real time, so it is polled and then stopped.
+  $resultPath = Join-Path $OutputRoot "$stage.json"
+  $proc = Start-Process -FilePath $FactorioExe -PassThru `
+    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
+                    "--start-server", $save,
+                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
+    -RedirectStandardOutput (Join-Path $LogRoot "$stage.stdout.log") `
+    -RedirectStandardError (Join-Path $LogRoot "$stage.stderr.log")
+
+  $deadline = (Get-Date).AddMinutes($deadlineMinutes)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path $resultPath) { break }
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  Start-Sleep -Seconds 2
+  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
+  Start-Sleep -Seconds 1
+  Save-StageLog $stage | Out-Null
+  return [pscustomobject]@{ SaveCreated = $true; Result = Get-Result $stage }
+}
+
 # --------------------------------------------------------------- functional
 
 Write-Stage "Stage 1/4  functional acceptance flow"
@@ -169,121 +200,61 @@ else {
 }
 
 Write-Stage "Shared queue save/load capture"
-Set-TestMode "queue-capture"
-$queueCaptureSave = Join-Path $RunRoot "queue-capture.zip"
-Invoke-Factorio "queue-capture-create" @("--create", $queueCaptureSave) | Out-Null
-
 $capturedQueuePhases = @()
-if (-not (Test-Path $queueCaptureSave)) {
+$queueCaptureOutcome = Invoke-RealtimeCapture "queue-capture" 4
+$queueCapture = $queueCaptureOutcome.Result
+if (-not $queueCaptureOutcome.SaveCreated) {
   Write-Fail "queue save/load capture map creation"
+} elseif ($queueCapture.passed) {
+  $capturedQueuePhases = @($queueCapture.saved)
+  Write-Pass "captured queue phases: $($capturedQueuePhases -join ', ')"
 } else {
-  $queueCaptureResultPath = Join-Path $OutputRoot "queue-capture.json"
-  $proc = Start-Process -FilePath $FactorioExe -PassThru `
-    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
-                    "--start-server", $queueCaptureSave,
-                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
-    -RedirectStandardOutput (Join-Path $LogRoot "queue-capture.stdout.log") `
-    -RedirectStandardError (Join-Path $LogRoot "queue-capture.stderr.log")
+  Write-Fail "queue save/load capture"
+  Show-ScriptError "queue-capture"
+}
 
-  $deadline = (Get-Date).AddMinutes(4)
-  while ((Get-Date) -lt $deadline) {
-    if (Test-Path $queueCaptureResultPath) { break }
-    if ($proc.HasExited) { break }
-    Start-Sleep -Milliseconds 500
-  }
-  Start-Sleep -Seconds 2
-  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
-  Start-Sleep -Seconds 1
-  Save-StageLog "queue-capture" | Out-Null
-
-  $queueCapture = Get-Result "queue-capture"
-  if ($queueCapture -and $queueCapture.passed) {
-    $capturedQueuePhases = @($queueCapture.saved)
-    Write-Pass "captured queue phases: $($capturedQueuePhases -join ', ')"
-  } else {
-    Write-Fail "queue save/load capture"
-    Show-ScriptError "queue-capture"
-  }
+Write-Stage "Two-tractor fleet save/load capture"
+$capturedFleetPhases = @()
+$fleetCaptureOutcome = Invoke-RealtimeCapture "fleet-capture" 4
+$fleetCapture = $fleetCaptureOutcome.Result
+if (-not $fleetCaptureOutcome.SaveCreated) {
+  Write-Fail "fleet save/load capture map creation"
+} elseif ($fleetCapture.passed) {
+  $capturedFleetPhases = @($fleetCapture.saved)
+  Write-Pass "captured fleet phases: $($capturedFleetPhases -join ', ')"
+} else {
+  Write-Fail "fleet save/load capture"
+  Show-ScriptError "fleet-capture"
 }
 
 Write-Stage "Crop cycle save/load capture"
-Set-TestMode "cycle-capture"
-$cycleCaptureSave = Join-Path $RunRoot "cycle-capture.zip"
-Invoke-Factorio "cycle-capture-create" @("--create", $cycleCaptureSave) | Out-Null
-
 $capturedCyclePhases = @()
-if (-not (Test-Path $cycleCaptureSave)) {
+$cycleCaptureOutcome = Invoke-RealtimeCapture "cycle-capture" 6
+$cycleCapture = $cycleCaptureOutcome.Result
+if (-not $cycleCaptureOutcome.SaveCreated) {
   Write-Fail "crop cycle capture map creation"
+} elseif ($cycleCapture.passed) {
+  $capturedCyclePhases = @($cycleCapture.saved)
+  Write-Pass "captured crop phases: $($capturedCyclePhases -join ', ')"
 } else {
-  $cycleCaptureResultPath = Join-Path $OutputRoot "cycle-capture.json"
-  $proc = Start-Process -FilePath $FactorioExe -PassThru `
-    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
-                    "--start-server", $cycleCaptureSave,
-                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
-    -RedirectStandardOutput (Join-Path $LogRoot "cycle-capture.stdout.log") `
-    -RedirectStandardError (Join-Path $LogRoot "cycle-capture.stderr.log")
-
-  $deadline = (Get-Date).AddMinutes(6)
-  while ((Get-Date) -lt $deadline) {
-    if (Test-Path $cycleCaptureResultPath) { break }
-    if ($proc.HasExited) { break }
-    Start-Sleep -Milliseconds 500
-  }
-  Start-Sleep -Seconds 2
-  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
-  Start-Sleep -Seconds 1
-  Save-StageLog "cycle-capture" | Out-Null
-
-  $cycleCapture = Get-Result "cycle-capture"
-  if ($cycleCapture -and $cycleCapture.passed) {
-    $capturedCyclePhases = @($cycleCapture.saved)
-    Write-Pass "captured crop phases: $($capturedCyclePhases -join ', ')"
-  } else {
-    Write-Fail "crop phase capture"
-    Show-ScriptError "cycle-capture"
-  }
+  Write-Fail "crop phase capture"
+  Show-ScriptError "cycle-capture"
 }
 
 # ------------------------------------------------------------------ capture
 
 Write-Stage "Stage 2/4  capture a save in every controller phase"
-Set-TestMode "capture"
-$captureSave = Join-Path $RunRoot "capture.zip"
-Invoke-Factorio "capture-create" @("--create", $captureSave) | Out-Null
-
 $capturedPhases = @()
-if (-not (Test-Path $captureSave)) {
+$captureOutcome = Invoke-RealtimeCapture "capture" 6
+$capture = $captureOutcome.Result
+if (-not $captureOutcome.SaveCreated) {
   Write-Fail "capture map creation"
+} elseif ($capture.passed) {
+  $capturedPhases = @($capture.saved)
+  Write-Pass "captured phases: $($capturedPhases -join ', ')"
 } else {
-  # A headless server is the only mode that honours game.auto_save; --benchmark
-  # silently ignores it. The run is real time, so it is polled and then stopped.
-  $captureResultPath = Join-Path $OutputRoot "capture.json"
-  $proc = Start-Process -FilePath $FactorioExe -PassThru `
-    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
-                    "--start-server", $captureSave,
-                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
-    -RedirectStandardOutput (Join-Path $LogRoot "capture.stdout.log") `
-    -RedirectStandardError (Join-Path $LogRoot "capture.stderr.log")
-
-  $deadline = (Get-Date).AddMinutes(6)
-  while ((Get-Date) -lt $deadline) {
-    if (Test-Path $captureResultPath) { break }
-    if ($proc.HasExited) { break }
-    Start-Sleep -Milliseconds 500
-  }
-  Start-Sleep -Seconds 2
-  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
-  Start-Sleep -Seconds 1
-  Save-StageLog "capture" | Out-Null
-
-  $capture = Get-Result "capture"
-  if ($capture -and $capture.passed) {
-    $capturedPhases = @($capture.saved)
-    Write-Pass "captured phases: $($capturedPhases -join ', ')"
-  } else {
-    Write-Fail "phase capture"
-    Show-ScriptError "capture"
-  }
+  Write-Fail "phase capture"
+  Show-ScriptError "capture"
 }
 
 # ----------------------------------------------------------------- saveload
@@ -321,18 +292,36 @@ foreach ($phase in @("sowing", "harvesting")) {
   }
 }
 
-foreach ($phase in @("queue-working")) {
-  if ($capturedQueuePhases -notcontains $phase) { Write-Fail "queue save/load $phase (no save captured)"; continue }
+$specialReplays = @(
+  [pscustomobject]@{
+    Phase = "queue-working"; Captured = $capturedQueuePhases; Mode = "queue-replay"; Ticks = "40000"
+    Label = "queue"; Pass = "active and waiting fields completed exactly"
+  },
+  [pscustomobject]@{
+    Phase = "fleet-working"; Captured = $capturedFleetPhases; Mode = "fleet-replay"; Ticks = "90000"
+    Label = "fleet"; Pass = "two working fields and one waiting field completed exactly"
+  }
+)
+
+foreach ($replay in $specialReplays) {
+  $phase = $replay.Phase
+  if ($replay.Captured -notcontains $phase) {
+    Write-Fail "$($replay.Label) save/load $phase (no save captured)"
+    continue
+  }
   $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*${phase}.zip" -ErrorAction SilentlyContinue |
     Select-Object -First 1
-  if (-not $save) { Write-Fail "queue save/load $phase (save file missing)"; continue }
-  Set-TestMode "queue-replay"
-  Invoke-Factorio "saveload-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", "40000", "--benchmark-runs", "1") | Out-Null
+  if (-not $save) {
+    Write-Fail "$($replay.Label) save/load $phase (save file missing)"
+    continue
+  }
+  Set-TestMode $replay.Mode
+  Invoke-Factorio "saveload-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", $replay.Ticks, "--benchmark-runs", "1") | Out-Null
   $result = Get-Result "saveload-$phase"
   if ($result -and $result.passed) {
-    Write-Pass "queue save/load ${phase}: active and waiting fields completed exactly"
+    Write-Pass "$($replay.Label) save/load ${phase}: $($replay.Pass)"
   } else {
-    Write-Fail "queue save/load $phase"
+    Write-Fail "$($replay.Label) save/load $phase"
     Show-ScriptError "saveload-$phase"
   }
 }

@@ -4,6 +4,7 @@ local visuals = require("scripts.visuals")
 
 local slice = {}
 local load_recovery_needed = false
+local recovered_job_areas = nil
 local profile = nil
 local start_lane
 local complete_job
@@ -442,14 +443,23 @@ local function recover_loaded_state()
   if not load_recovery_needed then return end
   load_recovery_needed = false
   local root = ensure_root()
+  recovered_job_areas = {}
   root.path_queue = {}
   root.pending_paths = {}
   root.outstanding_path_id = nil
 
-  for _, machine in pairs(root.machines) do
+  -- Recovery re-issues path requests, and the outstanding-request budget is
+  -- one, so a fleet's recovery order decides who moves first.  Iterate by
+  -- machine id rather than hash order so a multi-tractor load is deterministic.
+  local machine_ids = {}
+  for machine_id in pairs(root.machines) do machine_ids[#machine_ids + 1] = machine_id end
+  table.sort(machine_ids)
+  for _, machine_id in ipairs(machine_ids) do
+    local machine = root.machines[machine_id]
     local state = assignment_state(root, machine)
     local job = state and state.job
     if state and job.state ~= "completed" then
+      recovered_job_areas[job.id] = state.field.completed_area
       if not movement.entity(machine) then
         if job.state ~= "failed" then
           fail_job(state, "The assigned tractor was missing after loading. Progress has been preserved.")
@@ -1039,6 +1049,12 @@ function slice.debug_replace_tractor(surface_index, position)
   return machine ~= nil, error_message
 end
 
+local function snapshot_lane_claim(work_field)
+  local claim = work_field and work_field.lane_claim
+  if not claim then return nil end
+  return {lane = claim.lane, job_id = claim.job_id, machine_id = claim.machine_id}
+end
+
 function slice.snapshot(surface_index)
   local root = ensure_root()
   local state = root.surfaces[surface_index]
@@ -1074,6 +1090,8 @@ function slice.snapshot(surface_index)
       implement = job.implement,
       machine_id = job.machine_id,
       has_claim = job.lane_claim ~= nil,
+      claim_lane = job.lane_claim,
+      field_claim = snapshot_lane_claim(work_field),
       generation = job.generation,
       failure = job.failure
     } or nil,
@@ -1100,6 +1118,7 @@ function slice.snapshot(surface_index)
         if fleet_machine then
           result[#result + 1] = {id = fleet_machine.id, unit_number = fleet_machine.unit_number,
             valid = movement.entity(fleet_machine) ~= nil, job_id = fleet_machine.job_id,
+            generation = fleet_machine.generation,
             controller_state = fleet_machine.controller and fleet_machine.controller.state}
         end
       end
@@ -1117,7 +1136,11 @@ function slice.snapshot(surface_index)
           result[#result + 1] = {id = queued.id, field_id = queued.field_id, state = queued.state,
             operation = queued.operation, priority = queued.priority, request_tick = queued.request_tick,
             machine_id = queued.machine_id, failure = queued.failure,
-            completed_area = queued_field.completed_area}
+            has_claim = queued.lane_claim ~= nil,
+            claim_lane = queued.lane_claim,
+            field_claim = snapshot_lane_claim(queued_field),
+            recovered_completed_area = recovered_job_areas and recovered_job_areas[queued.id],
+            completed_area = queued_field.completed_area, total_area = queued_field.area}
         end
       end
       table.sort(result, function(a, b) return a.id < b.id end)
