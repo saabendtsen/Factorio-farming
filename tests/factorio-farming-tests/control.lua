@@ -394,6 +394,14 @@ local function queued_job(snap, id)
   return nil
 end
 
+local function fragmented_crop_rectangles(left)
+  local rectangles = {}
+  for offset = 0, 36, 4 do
+    rectangles[#rectangles + 1] = {left = left + offset, top = 0, right = left + offset + 2, bottom = 4}
+  end
+  return rectangles
+end
+
 local function init_queue()
   local surface = build_surface("queue")
   local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
@@ -451,12 +459,44 @@ local function drive_queue(event)
     truthy(storage.queue_paused and storage.queue_resumed, "pause does not requeue the job")
     truthy(storage.queue_destroyed and failed.machine_id == nil, "failed job is released but never requeued")
     -- Visuals must follow durable field identity, not the surface's selected
-    -- field alias: every live field on the surface projects its own operation
-    -- and crop lifecycle, whether or not it is the one currently presented.
+    -- field alias. Seed two completed fields with distinct crop growth stages
+    -- through the public debug seam; fragmented records force more than one
+    -- bounded projection visit per field.
+    if not storage.queue_visual_seed_tick then
+      local seeded, seed_error = remote.call("factorio_farming", "debug_seed_crop_stage", storage.queue_surface,
+        high.field_id, "sown", fragmented_crop_rectangles(160))
+      truthy(seeded, seed_error or "sown projection fixture failed")
+      seeded, seed_error = remote.call("factorio_farming", "debug_seed_crop_stage", storage.queue_surface,
+        paused.field_id, "growing", fragmented_crop_rectangles(240))
+      truthy(seeded, seed_error or "growing projection fixture failed")
+      storage.queue_visual_seed_tick = event.tick
+      storage.queue_visual_stress_until = event.tick + 20
+      storage.queue_visual_deadline = event.tick + 180
+      return
+    end
+
     local projected = snap.field_visuals or {}
-    -- Projection work is amortized, so let every field's dirty work drain
-    -- before reading the counts, but never longer than a bounded window.
-    storage.queue_visual_deadline = storage.queue_visual_deadline or event.tick + 60
+    local by_field = {}
+    for _, entry in ipairs(projected) do by_field[entry.field_id] = entry end
+    local high_visual = by_field[high.field_id]
+    local paused_visual = by_field[paused.field_id]
+    if event.tick <= storage.queue_visual_stress_until then
+      truthy(remote.call("factorio_farming", "debug_mark_visuals_dirty", storage.queue_surface, high.field_id),
+        "sown field could not be re-marked dirty")
+      truthy(remote.call("factorio_farming", "debug_mark_visuals_dirty", storage.queue_surface, paused.field_id),
+        "growing field could not be re-marked dirty")
+      if high_visual and paused_visual and high_visual.projection and paused_visual.projection and
+         high_visual.projection.crop.sown > 0 and paused_visual.projection.crop.growing > 0 then
+        storage.queue_visual_progress_tick = storage.queue_visual_progress_tick or event.tick
+      end
+      truthy(event.tick < storage.queue_visual_deadline,
+        "continually dirtied multi-field projections made no bounded progress")
+      return
+    end
+
+    truthy(storage.queue_visual_progress_tick and
+      storage.queue_visual_progress_tick <= storage.queue_visual_stress_until,
+      "multi-field projection did not complete a build while repeatedly dirtied")
     for _, entry in ipairs(projected) do
       if entry.dirty then
         truthy(event.tick < storage.queue_visual_deadline,
@@ -465,23 +505,25 @@ local function drive_queue(event)
       end
     end
     equal(#projected, 4, "every durable field on the surface projects visuals")
-    local by_field = {}
     for _, entry in ipairs(projected) do
       truthy(entry.count >= 3, "field " .. tostring(entry.field_id) ..
         " projects no visuals while it is not the selected field")
-      by_field[entry.field_id] = entry
     end
     local selected = 0
     for _, entry in ipairs(projected) do
       if entry.selected then selected = selected + 1 end
     end
     truthy(selected <= 1, "more than one field claims the selected alias")
-    -- Distinct authoritative lifecycles must project distinctly: completed
-    -- coverage adds rectangles, unstarted coverage adds none.
+    -- Distinct authoritative field operation progress and crop growth stages
+    -- must remain distinguishable through the public projection summary.
     truthy(by_field[high.field_id] and by_field[high.field_id].count > 3,
       "completed non-selected field does not project its operation coverage")
     truthy(by_field[paused.field_id] and by_field[paused.field_id].count > 3,
       "resumed non-selected field does not project its operation coverage")
+    truthy(high_visual.projection.crop.sown > 0 and high_visual.projection.crop.growing == 0,
+      "sown non-selected field does not expose its crop growth stage")
+    truthy(paused_visual.projection.crop.growing > 0 and paused_visual.projection.crop.sown == 0,
+      "growing non-selected field does not expose its crop growth stage")
     equal(by_field[failed.field_id] and by_field[failed.field_id].count, 3,
       "unstarted field projects coverage it never completed")
     write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id,

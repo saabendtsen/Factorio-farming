@@ -1135,7 +1135,8 @@ function slice.snapshot(surface_index)
       for _, live in pairs(root.fields) do
         if live.surface_index == surface_index and not live.migration_failed then
           result[#result + 1] = {field_id = live.id, count = visuals.object_count(live.id),
-            dirty = visuals.is_dirty(live.id), selected = work_field ~= nil and live.id == work_field.id}
+            dirty = visuals.is_dirty(live.id), selected = work_field ~= nil and live.id == work_field.id,
+            projection = visuals.summary(live.id)}
         end
       end
       table.sort(result, function(a, b) return a.field_id < b.field_id end)
@@ -1180,6 +1181,29 @@ local function addressed_field(root, surface_index, field_id)
   end
   local state = root.surfaces[surface_index]
   return state and state.field or nil
+end
+
+function slice.debug_seed_crop_stage(surface_index, field_id, stage, rectangles)
+  local work_field = addressed_field(ensure_root(), surface_index, field_id)
+  local elapsed = {sown = 0, growing = field_module.constants.growth_ticks / 2,
+    ready = field_module.constants.growth_ticks}
+  if not work_field then return false, "The requested field does not exist on this surface." end
+  if elapsed[stage] == nil then return false, "The requested crop growth stage is not supported." end
+  local sow_tick = game.tick - elapsed[stage]
+  local added = 0
+  for _, rectangle in ipairs(rectangles or {}) do
+    added = added + field_module.commit_operation(work_field, "sowing", rectangle, sow_tick)
+  end
+  work_field.next_growth_visual_tick = field_module.next_growth_tick(work_field, game.tick)
+  visuals.mark_dirty(work_field)
+  return added > 0, added > 0 and nil or "No cultivated uncovered area was available for sowing."
+end
+
+function slice.debug_mark_visuals_dirty(surface_index, field_id)
+  local work_field = addressed_field(ensure_root(), surface_index, field_id)
+  if not work_field then return false end
+  visuals.mark_dirty(work_field)
+  return true
 end
 
 function slice.clear_visuals(surface_index, field_id)
