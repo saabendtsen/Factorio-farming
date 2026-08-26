@@ -343,9 +343,9 @@ end
 
 function slice.on_configuration_changed()
   local root = ensure_root()
-  for _, state in pairs(root.surfaces) do
-    if state.field and not state.field.migration_failed then visuals.mark_dirty(state.field) end
-  end
+  -- Projections are disposable: a configuration change discards every one of
+  -- them and re-marks each live field by its durable identity.
+  visuals.reset(root.fields)
   for _, player in pairs(game.players) do enable_setup_shortcut(player) end
 end
 
@@ -487,7 +487,8 @@ local function recover_loaded_state()
       end
     end
   end
-  for _, work_field in pairs(root.fields) do visuals.mark_dirty(work_field) end
+  -- A load never trusts saved projections; it rebuilds them from field records.
+  visuals.reset(root.fields)
 end
 
 function slice.show_setup_hint(player)
@@ -1127,6 +1128,19 @@ function slice.snapshot(surface_index)
     end)(),
     pending_path_count = ensure_root().outstanding_path_id and 1 or 0,
     visual_count = work_field and visuals.object_count(work_field.id) or 0,
+    -- Every live field on the surface reports its own projection, so selected
+    -- and non-selected fields are observable apart from each other.
+    field_visuals = (function()
+      local result = {}
+      for _, live in pairs(root.fields) do
+        if live.surface_index == surface_index and not live.migration_failed then
+          result[#result + 1] = {field_id = live.id, count = visuals.object_count(live.id),
+            dirty = visuals.is_dirty(live.id), selected = work_field ~= nil and live.id == work_field.id}
+        end
+      end
+      table.sort(result, function(a, b) return a.field_id < b.field_id end)
+      return result
+    end)(),
     queued_jobs = (function()
       local result = {}
       for _, job_id in ipairs(root.queued_job_ids or {}) do
@@ -1155,14 +1169,27 @@ function slice.debug_add_tractor(surface_index, position)
   return machine ~= nil, error_message, machine and machine.id
 end
 
-function slice.clear_visuals(surface_index)
-  local state = ensure_root().surfaces[surface_index]
-  if state and state.field then visuals.clear(state.field.id) end
+-- `field_id` addresses any live field on the surface by durable identity;
+-- omitting it keeps the original alias-addressed behaviour for the field
+-- currently presented to the player.
+local function addressed_field(root, surface_index, field_id)
+  if field_id then
+    local work_field = root.fields[field_id]
+    if work_field and work_field.surface_index == surface_index then return work_field end
+    return nil
+  end
+  local state = root.surfaces[surface_index]
+  return state and state.field or nil
 end
 
-function slice.rebuild_visuals(surface_index)
-  local state = ensure_root().surfaces[surface_index]
-  if state and state.field then visuals.rebuild(state.field) end
+function slice.clear_visuals(surface_index, field_id)
+  local work_field = addressed_field(ensure_root(), surface_index, field_id)
+  if work_field then visuals.clear(work_field.id) end
+end
+
+function slice.rebuild_visuals(surface_index, field_id)
+  local work_field = addressed_field(ensure_root(), surface_index, field_id)
+  if work_field then visuals.rebuild(work_field) end
 end
 
 return slice

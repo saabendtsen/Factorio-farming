@@ -450,7 +450,42 @@ local function drive_queue(event)
     equal(failed.completed_area, 0, "destroyed tractor leaves unstarted coverage for retry")
     truthy(storage.queue_paused and storage.queue_resumed, "pause does not requeue the job")
     truthy(storage.queue_destroyed and failed.machine_id == nil, "failed job is released but never requeued")
-    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id})
+    -- Visuals must follow durable field identity, not the surface's selected
+    -- field alias: every live field on the surface projects its own operation
+    -- and crop lifecycle, whether or not it is the one currently presented.
+    local projected = snap.field_visuals or {}
+    -- Projection work is amortized, so let every field's dirty work drain
+    -- before reading the counts, but never longer than a bounded window.
+    storage.queue_visual_deadline = storage.queue_visual_deadline or event.tick + 60
+    for _, entry in ipairs(projected) do
+      if entry.dirty then
+        truthy(event.tick < storage.queue_visual_deadline,
+          "field " .. tostring(entry.field_id) .. " never drained its visual dirty work")
+        return
+      end
+    end
+    equal(#projected, 4, "every durable field on the surface projects visuals")
+    local by_field = {}
+    for _, entry in ipairs(projected) do
+      truthy(entry.count >= 3, "field " .. tostring(entry.field_id) ..
+        " projects no visuals while it is not the selected field")
+      by_field[entry.field_id] = entry
+    end
+    local selected = 0
+    for _, entry in ipairs(projected) do
+      if entry.selected then selected = selected + 1 end
+    end
+    truthy(selected <= 1, "more than one field claims the selected alias")
+    -- Distinct authoritative lifecycles must project distinctly: completed
+    -- coverage adds rectangles, unstarted coverage adds none.
+    truthy(by_field[high.field_id] and by_field[high.field_id].count > 3,
+      "completed non-selected field does not project its operation coverage")
+    truthy(by_field[paused.field_id] and by_field[paused.field_id].count > 3,
+      "resumed non-selected field does not project its operation coverage")
+    equal(by_field[failed.field_id] and by_field[failed.field_id].count, 3,
+      "unstarted field projects coverage it never completed")
+    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id,
+      field_visuals = projected})
     script.on_event(defines.events.on_tick, nil)
   elseif event.tick >= storage.queue_deadline then
     write_result("queue", {passed = false, snapshot = snap})
@@ -1004,6 +1039,17 @@ local function drive_functional(event)
   end
 
   if event.tick <= storage.visual_rebuild_tick then return end
+  -- Rebuilds are amortized across every dirty field, so wait for this field's
+  -- own dirty work to drain rather than assuming a single tick restores it.
+  local rebuilt
+  for _, entry in ipairs(snapshots.full.field_visuals or {}) do
+    if entry.selected then rebuilt = entry end
+  end
+  truthy(rebuilt, "rebuilt field is not reported by durable field identity")
+  if rebuilt.dirty then
+    truthy(event.tick - storage.visual_rebuild_tick < 60, "visual rebuild never drained its dirty work")
+    return
+  end
   truthy(snapshots.full.visual_count >= 4, "visual rebuild did not restore projections")
   equal(snapshots.full.field.completed_area, 1024, "visual rebuild changed authoritative progress")
   write_result("result", {

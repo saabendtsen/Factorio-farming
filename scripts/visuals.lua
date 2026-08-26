@@ -1,6 +1,8 @@
 local field_module = require("scripts.field")
 
 local visuals = {}
+-- Projection work is bounded per tick across every dirty field, not per field,
+-- so an arbitrary number of live fields still costs a constant tick budget.
 local MAX_PROJECTIONS_PER_TICK = 8
 
 local function root()
@@ -10,10 +12,31 @@ local function root()
   return storage.farming
 end
 
+-- Durable field identity is the only authority for a projection. The surface's
+-- `state.field` alias merely names the field currently presented to the player
+-- and must never decide what gets drawn.
+local function live_field(field_id)
+  local fields = storage.farming.fields
+  local work_field = fields and fields[field_id]
+  if not work_field then return nil end
+  if work_field.id ~= field_id then return nil end
+  if work_field.migration_failed then return nil end
+  return work_field
+end
+
 local function destroy_objects(objects)
   for _, object in ipairs(objects or {}) do
     if object.valid then object.destroy() end
   end
+end
+
+-- Everything held per field is disposable: destroying it can never change
+-- authoritative field state, so any interruption is resolved by throwing the
+-- partial projection away and rebuilding from the field record.
+local function discard(state, field_id)
+  destroy_objects(state.visuals[field_id])
+  state.visuals[field_id] = nil
+  state.visual_builds[field_id] = nil
 end
 
 function visuals.mark_dirty(work_field)
@@ -59,56 +82,116 @@ local function build_specs(work_field)
   return specs
 end
 
-function visuals.update()
-  local state = root()
-  local field_id
-  local surface_index
-  for candidate = 1, storage.farming.next_field_id - 1 do
-    if state.visual_dirty[candidate] then
-      field_id = candidate
-      surface_index = state.visual_dirty[candidate]
-      break
-    end
+-- Dirty fields are served in a deterministic rotation so no field can starve
+-- behind a lower id that is re-marked every tick.
+local function rotation(state)
+  local ids = {}
+  for field_id in pairs(state.visual_dirty) do ids[#ids + 1] = field_id end
+  table.sort(ids)
+  local cursor = state.visual_cursor or 0
+  local start = 1
+  for index, field_id in ipairs(ids) do
+    if field_id > cursor then start = index; break end
+    if index == #ids then start = 1 end
   end
-  if not field_id then return end
+  local ordered = {}
+  for offset = 0, #ids - 1 do
+    ordered[#ordered + 1] = ids[((start - 1 + offset) % #ids) + 1]
+  end
+  return ordered
+end
 
-  local surface_state = storage.farming.surfaces[surface_index]
-  local work_field = surface_state and surface_state.field
-  if not work_field or work_field.id ~= field_id then
+-- Advances one field's projection by at most `budget` rectangles and returns
+-- how much of the budget was consumed.
+local function advance(state, field_id, budget)
+  local work_field = live_field(field_id)
+  if not work_field then
+    -- Unknown or invalid field identity: drop the projection, never the caller.
+    discard(state, field_id)
     state.visual_dirty[field_id] = nil
-    return
+    return 0
+  end
+  local surface = game.get_surface(work_field.surface_index)
+  if not surface or not surface.valid then
+    discard(state, field_id)
+    state.visual_dirty[field_id] = nil
+    return 0
   end
 
   local build = state.visual_builds[field_id]
   if not build then
-    destroy_objects(state.visuals[field_id])
+    discard(state, field_id)
     state.visuals[field_id] = {}
     build = {specs = build_specs(work_field), next_index = 1}
     state.visual_builds[field_id] = build
   end
-  local surface = game.get_surface(surface_index)
-  local last_index = math.min(#build.specs, build.next_index + MAX_PROJECTIONS_PER_TICK - 1)
+  state.visuals[field_id] = state.visuals[field_id] or {}
+
+  local objects = state.visuals[field_id]
+  local last_index = math.min(#build.specs, build.next_index + budget - 1)
   for index = build.next_index, last_index do
     build.specs[index].surface = surface
-    state.visuals[field_id][#state.visuals[field_id] + 1] = rendering.draw_rectangle(build.specs[index])
+    objects[#objects + 1] = rendering.draw_rectangle(build.specs[index])
   end
+  local drawn = math.max(0, last_index - build.next_index + 1)
   build.next_index = last_index + 1
   if build.next_index > #build.specs then
     state.visual_dirty[field_id] = nil
     state.visual_builds[field_id] = nil
   end
+  return drawn
+end
+
+function visuals.update()
+  local state = root()
+  local ordered = rotation(state)
+  if #ordered == 0 then
+    state.visual_cursor = 0
+    return
+  end
+  local budget = MAX_PROJECTIONS_PER_TICK
+  local last_touched = state.visual_cursor or 0
+  for _, field_id in ipairs(ordered) do
+    if budget <= 0 then break end
+    local before = budget
+    budget = budget - advance(state, field_id, budget)
+    last_touched = field_id
+    -- A field dropped for invalid identity consumes no budget, so the same tick
+    -- keeps serving real fields instead of stalling on a dead id.
+    if before == budget and state.visual_dirty[field_id] then break end
+  end
+  state.visual_cursor = last_touched
 end
 
 function visuals.clear(field_id)
   local state = root()
-  destroy_objects(state.visuals[field_id])
+  discard(state, field_id)
   state.visuals[field_id] = {}
-  state.visual_builds[field_id] = nil
 end
 
 function visuals.rebuild(work_field)
   visuals.clear(work_field.id)
   visuals.mark_dirty(work_field)
+end
+
+-- Load, configuration change, and any other interruption resolve the same way:
+-- throw every partial projection away and re-mark each live field, so nothing
+-- stale can outlive the field record it was derived from.
+function visuals.reset(fields)
+  local state = root()
+  for field_id in pairs(state.visuals) do discard(state, field_id) end
+  for field_id in pairs(state.visual_builds) do discard(state, field_id) end
+  state.visuals = {}
+  state.visual_builds = {}
+  state.visual_dirty = {}
+  state.visual_cursor = 0
+  for _, work_field in pairs(fields or {}) do
+    if not work_field.migration_failed then visuals.mark_dirty(work_field) end
+  end
+end
+
+function visuals.is_dirty(field_id)
+  return root().visual_dirty[field_id] ~= nil
 end
 
 function visuals.object_count(field_id)
