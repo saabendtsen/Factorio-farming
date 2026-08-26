@@ -33,7 +33,7 @@ local transitions = {
   travelling = {working = true, paused = true, failed = true},
   working = {completed = true, paused = true, failed = true},
   paused = {travelling = true, working = true, failed = true},
-  failed = {travelling = true, working = true},
+  failed = {waiting = true, travelling = true, working = true},
   completed = {}
 }
 
@@ -1036,12 +1036,55 @@ function slice.debug_resume(surface_index)
   return resume_state(surface_state(surface_index))
 end
 
-function slice.debug_destroy_tractor(surface_index)
-  local state = surface_state(surface_index)
-  local entity = state.machine and movement.entity(state.machine)
+local function destroy_machine_entity(machine)
+  local entity = machine and movement.entity(machine)
   if not entity then return false end
   entity.destroy({raise_destroy = true})
   return true
+end
+
+function slice.debug_destroy_tractor(surface_index)
+  return destroy_machine_entity(surface_state(surface_index).machine)
+end
+
+function slice.debug_destroy_tractor_by_id(surface_index, machine_id)
+  local root = ensure_root()
+  local machine = root.machines[machine_id]
+  if not machine or machine.surface_index ~= surface_index then return false end
+  return destroy_machine_entity(machine)
+end
+
+function slice.debug_retry_queued_field_job(surface_index, job_id)
+  local root = ensure_root()
+  local job = root.jobs[job_id]
+  local work_field = job and root.fields[job.field_id]
+  if not job or not work_field or work_field.surface_index ~= surface_index then
+    return false, "The requested farming job does not exist on this surface."
+  end
+  if work_field.migration_failed then
+    return false, "This field migration failed and cannot be resumed."
+  end
+  if job.state ~= "failed" then return false, "Only a failed farming job can be retried." end
+  local queued = false
+  for _, queued_job_id in ipairs(root.queued_job_ids or {}) do
+    if queued_job_id == job.id then
+      queued = true
+      break
+    end
+  end
+  if not queued then return false, "Only a queued fleet job can be retried." end
+  if job.machine_id or job.lane_claim or work_field.lane_claim then
+    return false, "The failed farming job still has an assignment or lane claim."
+  end
+  local completed_area = work_field.completed_area
+  local transitioned, transition_error = slice.transition(job, "waiting")
+  if not transitioned then return false, transition_error end
+  job.failure = nil
+  job.generation = job.generation + 1
+  job.paused_from = nil
+  job.paused_motion = nil
+  job.restart_from_work = nil
+  return true, nil, completed_area
 end
 
 function slice.debug_replace_tractor(surface_index, position)
@@ -1120,7 +1163,12 @@ function slice.snapshot(surface_index)
           result[#result + 1] = {id = fleet_machine.id, unit_number = fleet_machine.unit_number,
             valid = movement.entity(fleet_machine) ~= nil, job_id = fleet_machine.job_id,
             generation = fleet_machine.generation,
-            controller_state = fleet_machine.controller and fleet_machine.controller.state}
+            controller_state = fleet_machine.controller and fleet_machine.controller.state,
+            controller_purpose = fleet_machine.controller and fleet_machine.controller.purpose,
+            controller_goal = fleet_machine.controller and fleet_machine.controller.goal and
+              copy_position(fleet_machine.controller.goal) or nil,
+            controller_work_position = fleet_machine.controller and fleet_machine.controller.work_position and
+              copy_position(fleet_machine.controller.work_position) or nil}
         end
       end
       table.sort(result, function(a, b) return a.id < b.id end)
@@ -1148,12 +1196,14 @@ function slice.snapshot(surface_index)
         local queued = root.jobs[job_id]
         local queued_field = queued and root.fields[queued.field_id]
         if queued and queued_field and queued_field.surface_index == surface_index then
+          local next_uncovered = field_module.next_uncovered_for(queued_field, queued.operation)
           result[#result + 1] = {id = queued.id, field_id = queued.field_id, state = queued.state,
             operation = queued.operation, priority = queued.priority, request_tick = queued.request_tick,
             machine_id = queued.machine_id, failure = queued.failure,
             has_claim = queued.lane_claim ~= nil,
             claim_lane = queued.lane_claim,
             field_claim = snapshot_lane_claim(queued_field),
+            next_uncovered = next_uncovered and copy_position(next_uncovered) or nil,
             recovered_completed_area = recovered_job_areas and recovered_job_areas[queued.id],
             completed_area = queued_field.completed_area, total_area = queued_field.area}
         end

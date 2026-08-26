@@ -624,8 +624,15 @@ end
 local function check_fleet_invariants(snap, jobs, seen_areas, label)
   local claimed_by = {}
   local machines_by_id = {}
+  local queued_ids = {}
   for _, machine in ipairs(snap.machines or {}) do machines_by_id[machine.id] = machine end
+  for _, queued in ipairs(snap.queued_jobs or {}) do
+    truthy(not queued_ids[queued.id], label .. " contains duplicate queued job " .. tostring(queued.id))
+    queued_ids[queued.id] = true
+  end
+  equal(#(snap.queued_jobs or {}), #jobs, label .. " changed the queued fleet job count")
   for _, job in ipairs(jobs) do
+    truthy(queued_ids[job.id], label .. " lost queued field job " .. tostring(job.id))
     equal(job.total_area, FLEET_FIELD_AREA,
       label .. " field " .. tostring(job.id) .. " is not a 64x16 field")
     truthy(job.completed_area <= job.total_area,
@@ -660,6 +667,120 @@ local function check_fleet_invariants(snap, jobs, seen_areas, label)
       truthy(claimed_by[machine.id] == machine.job_id,
         label .. " tractor " .. tostring(machine.id) .. " holds a stale job claim")
     end
+  end
+end
+
+local function init_fleet_failure()
+  local fixture = create_fleet_fixture("fleet-failure", "fleet failure")
+  storage.fleet_failure = {
+    surface = fixture.surface,
+    first_id = fixture.first_id,
+    second_id = fixture.second_id,
+    waiting_id = fixture.waiting_id,
+    areas = {},
+    deadline = game.tick + 90000
+  }
+end
+
+local function drive_fleet_failure(event)
+  local run = storage.fleet_failure
+  local snap = snapshot(run.surface)
+  local first = queued_job(snap, run.first_id)
+  local second = queued_job(snap, run.second_id)
+  local waiting = queued_job(snap, run.waiting_id)
+  truthy(first and second and waiting, "fleet failure scenario lost a durable job")
+  check_fleet_invariants(snap, {first, second, waiting}, run.areas, "fleet failure")
+
+  if not run.destroyed_machine_id and first.state == "working" and second.state == "working" and
+     first.completed_area >= 64 and second.completed_area >= 64 then
+    run.destroyed_machine_id = first.machine_id
+    run.survivor_machine_id = second.machine_id
+    run.interrupted_area = first.completed_area
+    run.survivor_area_at_failure = second.completed_area
+    truthy(first.next_uncovered, "interrupted field job has no authoritative restart coordinate")
+    run.restart_coordinate = {x = first.next_uncovered.x, y = first.next_uncovered.y}
+    truthy(remote.call("factorio_farming", "debug_destroy_tractor_by_id", run.surface, run.destroyed_machine_id),
+      "identified fleet tractor could not be destroyed")
+    return
+  end
+
+  if run.destroyed_machine_id and not run.replacement_machine_id then
+    equal(first.state, "failed", "destroyed tractor did not fail only its own assignment")
+    equal(first.machine_id, nil, "failed field job retained its destroyed tractor")
+    equal(first.completed_area, run.interrupted_area, "failed field job changed authoritative coverage while isolated")
+    equal(first.next_uncovered.x, run.restart_coordinate.x,
+      "failed field job changed its authoritative restart x coordinate")
+    equal(first.next_uncovered.y, run.restart_coordinate.y,
+      "failed field job changed its authoritative restart y coordinate")
+    if second.state ~= "completed" then
+      equal(second.machine_id, run.survivor_machine_id,
+        "surviving field job was reassigned after peer destruction")
+    end
+    truthy(second.state ~= "failed", "peer tractor destruction failed the surviving field job")
+    truthy(second.completed_area >= run.survivor_area_at_failure,
+      "surviving field job lost authoritative coverage")
+    if second.completed_area <= run.survivor_area_at_failure then return end
+    run.survivor_progress_seen = true
+
+    local retried, retry_error, retry_area = remote.call("factorio_farming", "debug_retry_queued_field_job",
+      run.surface, first.id)
+    truthy(retried, retry_error or "failed fleet field job could not be retried")
+    equal(retry_area, run.interrupted_area, "retry mutated authoritative coverage before reassignment")
+    local added, add_error, machine_id = remote.call("factorio_farming", "debug_add_tractor",
+      run.surface, {x = -20, y = 72})
+    truthy(added, add_error or "replacement fleet tractor could not be created")
+    truthy(machine_id ~= run.destroyed_machine_id and machine_id ~= run.survivor_machine_id,
+      "replacement tractor did not receive a distinct identity")
+    run.replacement_machine_id = machine_id
+    return
+  end
+
+  if run.replacement_machine_id then
+    truthy(first.completed_area >= run.interrupted_area, "retried field job rewound authoritative coverage")
+    local replacement = machine_entry(snap, run.replacement_machine_id)
+    if not run.restart_target_seen and first.completed_area == run.interrupted_area and replacement then
+      local target = replacement.controller_purpose == "lane-start" and replacement.controller_goal or
+        (replacement.controller_state == "working" and replacement.controller_work_position or nil)
+      if target then
+        equal(target.x, run.restart_coordinate.x,
+          "replacement tractor did not target the first authoritative uncovered x coordinate")
+        equal(target.y, run.restart_coordinate.y,
+          "replacement tractor did not target the first authoritative uncovered y coordinate")
+        run.restart_target_seen = true
+      end
+    end
+    if first.state ~= "completed" then
+      equal(first.machine_id, run.replacement_machine_id,
+        "retried field job was assigned to the wrong tractor")
+    end
+    if second.state ~= "completed" then
+      equal(second.machine_id, run.survivor_machine_id,
+        "surviving field job changed tractor before completion")
+    end
+  end
+
+  if first.state == "completed" and second.state == "completed" and waiting.state == "completed" then
+    truthy(run.survivor_progress_seen, "surviving tractor never advanced while peer assignment was failed")
+    truthy(run.restart_target_seen,
+      "replacement tractor never exposed the first authoritative uncovered coordinate as its initial work target")
+    for _, job in ipairs({first, second, waiting}) do
+      equal(job.completed_area, FLEET_FIELD_AREA, "fleet failure field job did not complete exact 1024/1024 coverage")
+      equal(job.machine_id, nil, "fleet failure completion retained a tractor assignment")
+      truthy(not job.has_claim, "fleet failure completion retained a job lane claim")
+      equal(job.field_claim, nil, "fleet failure completion retained a field lane claim")
+      equal(job.failure, nil, "fleet failure completion retained a failure")
+    end
+    for _, machine in ipairs(snap.machines or {}) do
+      equal(machine.job_id, nil, "fleet failure completion retained a reciprocal tractor claim")
+    end
+    equal(snap.pending_path_count, 0, "fleet failure completion left a pending path")
+    write_result("fleet-failure", {passed = true, interrupted_area = run.interrupted_area,
+      survivor_machine_id = run.survivor_machine_id, replacement_machine_id = run.replacement_machine_id,
+      completed_areas = {first.completed_area, second.completed_area, waiting.completed_area}})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= run.deadline then
+    write_result("fleet-failure", {passed = false, snapshot = snap})
+    fail("fleet failure isolation timeout")
   end
 end
 
@@ -1036,6 +1157,11 @@ local function drive_functional(event)
     storage.destroyed = true
   elseif storage.destroyed and not storage.replaced and destroyed.job.state == "failed" then
     equal(destroyed.field.completed_area, storage.destroyed_area, "tractor destruction changed progress")
+    local retried, retry_error = remote.call("factorio_farming", "debug_retry_queued_field_job",
+      storage.test_surfaces.destroy, destroyed.job.id)
+    truthy(not retried, "primary non-fleet field job was accepted by the queue-only retry seam")
+    equal(retry_error, "Only a queued fleet job can be retried.",
+      "primary non-fleet field job returned the wrong queue-only retry error")
     local replaced, replace_error = remote.call("factorio_farming", "debug_replace_tractor",
       storage.test_surfaces.destroy, TRACTOR_POSITION)
     truthy(replaced, replace_error or "replacement tractor failed")
@@ -1546,6 +1672,7 @@ local initializers = {
   functional = init_functional,
   queue = init_queue,
   fleet = init_fleet,
+  ["fleet-failure"] = init_fleet_failure,
   ["queue-capture"] = init_queue_capture,
   ["fleet-capture"] = init_fleet_capture
 }
@@ -1558,6 +1685,7 @@ local drivers = {
   functional = drive_functional,
   queue = drive_queue,
   fleet = drive_fleet,
+  ["fleet-failure"] = drive_fleet_failure,
   ["queue-capture"] = drive_queue_capture,
   ["queue-replay"] = drive_queue_verify,
   ["fleet-capture"] = drive_fleet_capture,

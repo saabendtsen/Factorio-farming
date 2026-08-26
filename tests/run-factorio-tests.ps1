@@ -199,6 +199,22 @@ else {
   else { Write-Fail "two-tractor fleet dispatch"; Show-ScriptError "fleet" }
 }
 
+Write-Stage "Per-tractor failure isolation and exact restart"
+Set-TestMode "fleet-failure"
+$fleetFailureSave = Join-Path $RunRoot "fleet-failure-test.zip"
+Invoke-Factorio "fleet-failure-create" @("--create", $fleetFailureSave) | Out-Null
+if (-not (Test-Path $fleetFailureSave)) { Write-Fail "fleet failure map creation" }
+else {
+  Invoke-Factorio "fleet-failure" @("--benchmark", $fleetFailureSave, "--benchmark-ticks", "100000", "--benchmark-runs", "1") | Out-Null
+  $fleetFailure = Get-Result "fleet-failure"
+  if ($fleetFailure -and $fleetFailure.passed) {
+    Write-Pass "fleet failure: survivor continued and replacement resumed exact coverage"
+  } else {
+    Write-Fail "fleet failure isolation and restart"
+    Show-ScriptError "fleet-failure"
+  }
+}
+
 Write-Stage "Shared queue save/load capture"
 $capturedQueuePhases = @()
 $queueCaptureOutcome = Invoke-RealtimeCapture "queue-capture" 4
