@@ -394,6 +394,14 @@ local function queued_job(snap, id)
   return nil
 end
 
+local function fragmented_crop_rectangles(left)
+  local rectangles = {}
+  for offset = 0, 36, 4 do
+    rectangles[#rectangles + 1] = {left = left + offset, top = 0, right = left + offset + 2, bottom = 4}
+  end
+  return rectangles
+end
+
 local function init_queue()
   local surface = build_surface("queue")
   local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
@@ -450,7 +458,79 @@ local function drive_queue(event)
     equal(failed.completed_area, 0, "destroyed tractor leaves unstarted coverage for retry")
     truthy(storage.queue_paused and storage.queue_resumed, "pause does not requeue the job")
     truthy(storage.queue_destroyed and failed.machine_id == nil, "failed job is released but never requeued")
-    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id})
+    -- Visuals must follow durable field identity, not the surface's selected
+    -- field alias. Seed two completed fields with distinct crop growth stages
+    -- through the public debug seam; fragmented records force more than one
+    -- bounded projection visit per field.
+    if not storage.queue_visual_seed_tick then
+      local seeded, seed_error = remote.call("factorio_farming", "debug_seed_crop_stage", storage.queue_surface,
+        high.field_id, "sown", fragmented_crop_rectangles(160))
+      truthy(seeded, seed_error or "sown projection fixture failed")
+      seeded, seed_error = remote.call("factorio_farming", "debug_seed_crop_stage", storage.queue_surface,
+        paused.field_id, "growing", fragmented_crop_rectangles(240))
+      truthy(seeded, seed_error or "growing projection fixture failed")
+      storage.queue_visual_seed_tick = event.tick
+      storage.queue_visual_stress_until = event.tick + 20
+      storage.queue_visual_deadline = event.tick + 180
+      return
+    end
+
+    local projected = snap.field_visuals or {}
+    local by_field = {}
+    for _, entry in ipairs(projected) do by_field[entry.field_id] = entry end
+    local high_visual = by_field[high.field_id]
+    local paused_visual = by_field[paused.field_id]
+    if event.tick <= storage.queue_visual_stress_until then
+      truthy(remote.call("factorio_farming", "debug_mark_visuals_dirty", storage.queue_surface, high.field_id),
+        "sown field could not be re-marked dirty")
+      truthy(remote.call("factorio_farming", "debug_mark_visuals_dirty", storage.queue_surface, paused.field_id),
+        "growing field could not be re-marked dirty")
+      if high_visual and paused_visual and high_visual.projection and paused_visual.projection and
+         high_visual.projection.rectangle_counts.crop_growth.sown > 0 and
+         paused_visual.projection.rectangle_counts.crop_growth.growing > 0 then
+        storage.queue_visual_progress_tick = storage.queue_visual_progress_tick or event.tick
+      end
+      truthy(event.tick < storage.queue_visual_deadline,
+        "continually dirtied multi-field projections made no bounded progress")
+      return
+    end
+
+    truthy(storage.queue_visual_progress_tick and
+      storage.queue_visual_progress_tick <= storage.queue_visual_stress_until,
+      "multi-field projection did not complete a build while repeatedly dirtied")
+    for _, entry in ipairs(projected) do
+      if entry.dirty then
+        truthy(event.tick < storage.queue_visual_deadline,
+          "field " .. tostring(entry.field_id) .. " never drained its visual dirty work")
+        return
+      end
+    end
+    equal(#projected, 4, "every durable field on the surface projects visuals")
+    for _, entry in ipairs(projected) do
+      truthy(entry.count >= 3, "field " .. tostring(entry.field_id) ..
+        " projects no visuals while it is not the selected field")
+    end
+    local selected = 0
+    for _, entry in ipairs(projected) do
+      if entry.selected then selected = selected + 1 end
+    end
+    truthy(selected <= 1, "more than one field claims the selected alias")
+    -- Distinct authoritative field operation progress and crop growth stages
+    -- must remain distinguishable through the public projection summary.
+    truthy(by_field[high.field_id] and by_field[high.field_id].count > 3,
+      "completed non-selected field does not project its operation coverage")
+    truthy(by_field[paused.field_id] and by_field[paused.field_id].count > 3,
+      "resumed non-selected field does not project its operation coverage")
+    local high_crop = high_visual.projection.rectangle_counts.crop_growth
+    local paused_crop = paused_visual.projection.rectangle_counts.crop_growth
+    truthy(high_crop.sown > 0 and high_crop.growing == 0,
+      "sown non-selected field does not expose its crop growth stage")
+    truthy(paused_crop.growing > 0 and paused_crop.sown == 0,
+      "growing non-selected field does not expose its crop growth stage")
+    equal(by_field[failed.field_id] and by_field[failed.field_id].count, 3,
+      "unstarted field projects coverage it never completed")
+    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id,
+      field_visuals = projected})
     script.on_event(defines.events.on_tick, nil)
   elseif event.tick >= storage.queue_deadline then
     write_result("queue", {passed = false, snapshot = snap})
@@ -1004,6 +1084,17 @@ local function drive_functional(event)
   end
 
   if event.tick <= storage.visual_rebuild_tick then return end
+  -- Rebuilds are amortized across every dirty field, so wait for this field's
+  -- own dirty work to drain rather than assuming a single tick restores it.
+  local rebuilt
+  for _, entry in ipairs(snapshots.full.field_visuals or {}) do
+    if entry.selected then rebuilt = entry end
+  end
+  truthy(rebuilt, "rebuilt field is not reported by durable field identity")
+  if rebuilt.dirty then
+    truthy(event.tick - storage.visual_rebuild_tick < 60, "visual rebuild never drained its dirty work")
+    return
+  end
   truthy(snapshots.full.visual_count >= 4, "visual rebuild did not restore projections")
   equal(snapshots.full.field.completed_area, 1024, "visual rebuild changed authoritative progress")
   write_result("result", {
