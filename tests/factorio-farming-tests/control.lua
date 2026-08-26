@@ -458,6 +458,103 @@ local function drive_queue(event)
   end
 end
 
+-- ---------------------------------------------------------------- queue save/load
+
+-- A queue save must contain both sides of the scheduler boundary: an assigned
+-- field already doing work and a distinct waiting field.  This deliberately
+-- uses only the public debug queue and snapshot interfaces so the acceptance
+-- test remains valid when the scheduler storage is refactored.
+local function init_queue_capture()
+  local surface = build_surface("queue-capture")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "queue save capture tractor setup failed")
+
+  local queued, queue_error, active_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "queue save capture active field failed")
+  queued, queue_error, waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 5, "cultivation")
+  truthy(queued, queue_error or "queue save capture waiting field failed")
+
+  storage.queue_capture = {
+    surface = surface.index,
+    active_id = active_id,
+    waiting_id = waiting_id,
+    deadline = game.tick + 30000
+  }
+end
+
+local function drive_queue_capture(event)
+  local capture = storage.queue_capture
+  local snap = snapshot(capture.surface)
+  local active = queued_job(snap, capture.active_id)
+  local waiting = queued_job(snap, capture.waiting_id)
+  truthy(active and waiting, "queue save capture lost durable jobs")
+
+  if active.state == "working" and active.completed_area >= 64 then
+    equal(snap.job.id, capture.active_id, "queue save capture assigned wrong field")
+    equal(active.machine_id, snap.machine.id, "queue save capture active assignment")
+    equal(waiting.state, "waiting", "queue save capture waiting field dispatched early")
+    equal(waiting.machine_id, nil, "queue save capture waiting field assigned early")
+    storage.test_capture = "queue-working"
+    storage.capture_surface = capture.surface
+    storage.queue_capture_active_id = active.id
+    storage.queue_capture_waiting_id = waiting.id
+    storage.queue_capture_active_area = active.completed_area
+    storage.queue_capture_waiting_area = waiting.completed_area
+    game.auto_save("queue-working")
+    write_result("queue-capture", {passed = true, saved = {"queue-working"}, tick = event.tick})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= capture.deadline then
+    write_result("queue-capture", {passed = false, snapshot = snap})
+    fail("queue save capture timeout")
+  end
+end
+
+local queue_verify = {}
+
+local function drive_queue_verify(event)
+  local surface = storage.capture_surface
+  local snap = snapshot(surface)
+  local active = queued_job(snap, storage.queue_capture_active_id)
+  local waiting = queued_job(snap, storage.queue_capture_waiting_id)
+  truthy(active and waiting, "queue save/load lost a queued job")
+
+  if not queue_verify.started then
+    queue_verify.started = event.tick
+    equal(snap.job.id, storage.queue_capture_active_id, "queue load selected the wrong active field")
+    equal(active.state, "working", "queue working field did not remain working after load")
+    equal(active.completed_area, storage.queue_capture_active_area,
+      "queue load changed active authoritative coverage")
+    equal(waiting.state, "waiting", "queue waiting field did not remain queued after load")
+    equal(waiting.machine_id, nil, "queue waiting field was assigned after load")
+    equal(waiting.completed_area, storage.queue_capture_waiting_area,
+      "queue load changed waiting authoritative coverage")
+    truthy(snap.machine.generation > 1, "queue load did not invalidate saved controller")
+    return
+  end
+
+  if event.tick - queue_verify.started > 30000 then
+    write_result("saveload-queue-working", {passed = false, snapshot = snap})
+    fail("queue save/load replay timeout")
+  end
+
+  if active.state ~= "completed" or waiting.state ~= "completed" then return end
+  equal(active.completed_area, 1024, "queue active field completed exact coverage after load")
+  equal(waiting.completed_area, 1024, "queue waiting field completed exact coverage after load")
+  equal(waiting.failure, nil, "queue waiting field failed instead of dispatching after load")
+  equal(snap.machine.job_id, nil, "queue machine retained assignment after both fields completed")
+  equal(snap.pending_path_count, 0, "queue replay left a pending path")
+  write_result("saveload-queue-working", {
+    passed = true,
+    active_completed_area = active.completed_area,
+    waiting_completed_area = waiting.completed_area,
+    ticks_after_load = event.tick - queue_verify.started
+  })
+  script.on_event(defines.events.on_tick, nil)
+end
+
 local function run_contextual_action_tests()
   local surface = build_surface("contextual-action")
   local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
@@ -1018,6 +1115,8 @@ script.on_init(function()
     init_functional()
   elseif mode == "queue" then
     init_queue()
+  elseif mode == "queue-capture" then
+    init_queue_capture()
   else
     fail("mode '" .. tostring(mode) .. "' does not create a map")
   end
@@ -1034,6 +1133,10 @@ script.on_event(defines.events.on_tick, function(event)
     drive_replay(event)
   elseif mode == "queue" then
     drive_queue(event)
+  elseif mode == "queue-capture" then
+    drive_queue_capture(event)
+  elseif mode == "queue-replay" then
+    drive_queue_verify(event)
   else
     drive_functional(event)
   end
