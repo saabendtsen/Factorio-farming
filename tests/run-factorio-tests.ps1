@@ -106,11 +106,13 @@ function Show-ScriptError($stage) {
   }
 }
 
-function Invoke-RealtimeCapture($stage, $mode, $saveFileName, [int]$deadlineMinutes) {
-  Set-TestMode $mode
-  $save = Join-Path $RunRoot $saveFileName
+function Invoke-RealtimeCapture($stage, [int]$deadlineMinutes) {
+  Set-TestMode $stage
+  $save = Join-Path $RunRoot "$stage.zip"
   Invoke-Factorio "$stage-create" @("--create", $save) | Out-Null
-  if (-not (Test-Path $save)) { return $null }
+  if (-not (Test-Path $save)) {
+    return [pscustomobject]@{ SaveCreated = $false; Result = $null }
+  }
 
   # A headless server is the only mode that honours game.auto_save; --benchmark
   # silently ignores it. The run is real time, so it is polled and then stopped.
@@ -132,7 +134,7 @@ function Invoke-RealtimeCapture($stage, $mode, $saveFileName, [int]$deadlineMinu
   if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
   Start-Sleep -Seconds 1
   Save-StageLog $stage | Out-Null
-  return Get-Result $stage
+  return [pscustomobject]@{ SaveCreated = $true; Result = Get-Result $stage }
 }
 
 # --------------------------------------------------------------- functional
@@ -199,8 +201,9 @@ else {
 
 Write-Stage "Shared queue save/load capture"
 $capturedQueuePhases = @()
-$queueCapture = Invoke-RealtimeCapture "queue-capture" "queue-capture" "queue-capture.zip" 4
-if (-not $queueCapture) {
+$queueCaptureOutcome = Invoke-RealtimeCapture "queue-capture" 4
+$queueCapture = $queueCaptureOutcome.Result
+if (-not $queueCaptureOutcome.SaveCreated) {
   Write-Fail "queue save/load capture map creation"
 } elseif ($queueCapture.passed) {
   $capturedQueuePhases = @($queueCapture.saved)
@@ -212,8 +215,9 @@ if (-not $queueCapture) {
 
 Write-Stage "Two-tractor fleet save/load capture"
 $capturedFleetPhases = @()
-$fleetCapture = Invoke-RealtimeCapture "fleet-capture" "fleet-capture" "fleet-capture.zip" 4
-if (-not $fleetCapture) {
+$fleetCaptureOutcome = Invoke-RealtimeCapture "fleet-capture" 4
+$fleetCapture = $fleetCaptureOutcome.Result
+if (-not $fleetCaptureOutcome.SaveCreated) {
   Write-Fail "fleet save/load capture map creation"
 } elseif ($fleetCapture.passed) {
   $capturedFleetPhases = @($fleetCapture.saved)
@@ -225,8 +229,9 @@ if (-not $fleetCapture) {
 
 Write-Stage "Crop cycle save/load capture"
 $capturedCyclePhases = @()
-$cycleCapture = Invoke-RealtimeCapture "cycle-capture" "cycle-capture" "cycle-capture.zip" 6
-if (-not $cycleCapture) {
+$cycleCaptureOutcome = Invoke-RealtimeCapture "cycle-capture" 6
+$cycleCapture = $cycleCaptureOutcome.Result
+if (-not $cycleCaptureOutcome.SaveCreated) {
   Write-Fail "crop cycle capture map creation"
 } elseif ($cycleCapture.passed) {
   $capturedCyclePhases = @($cycleCapture.saved)
@@ -240,8 +245,9 @@ if (-not $cycleCapture) {
 
 Write-Stage "Stage 2/4  capture a save in every controller phase"
 $capturedPhases = @()
-$capture = Invoke-RealtimeCapture "capture" "capture" "capture.zip" 6
-if (-not $capture) {
+$captureOutcome = Invoke-RealtimeCapture "capture" 6
+$capture = $captureOutcome.Result
+if (-not $captureOutcome.SaveCreated) {
   Write-Fail "capture map creation"
 } elseif ($capture.passed) {
   $capturedPhases = @($capture.saved)

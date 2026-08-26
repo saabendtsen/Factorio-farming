@@ -1084,6 +1084,12 @@ function slice.snapshot(surface_index)
       implement = job.implement,
       machine_id = job.machine_id,
       has_claim = job.lane_claim ~= nil,
+      claim_lane = job.lane_claim,
+      field_claim = work_field.lane_claim and {
+        lane = work_field.lane_claim.lane,
+        job_id = work_field.lane_claim.job_id,
+        machine_id = work_field.lane_claim.machine_id
+      } or nil,
       generation = job.generation,
       failure = job.failure
     } or nil,
@@ -1129,6 +1135,12 @@ function slice.snapshot(surface_index)
             operation = queued.operation, priority = queued.priority, request_tick = queued.request_tick,
             machine_id = queued.machine_id, failure = queued.failure,
             has_claim = queued.lane_claim ~= nil,
+            claim_lane = queued.lane_claim,
+            field_claim = queued_field.lane_claim and {
+              lane = queued_field.lane_claim.lane,
+              job_id = queued_field.lane_claim.job_id,
+              machine_id = queued_field.lane_claim.machine_id
+            } or nil,
             recovered_completed_area = recovered_job_areas and recovered_job_areas[queued.id],
             completed_area = queued_field.completed_area, total_area = queued_field.area}
         end

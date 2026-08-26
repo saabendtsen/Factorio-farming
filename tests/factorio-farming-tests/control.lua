@@ -562,8 +562,17 @@ local function check_fleet_invariants(snap, jobs, seen_areas, label)
       equal(machine.job_id, job.id,
         label .. " job " .. tostring(job.id) .. " is not claimed back by its tractor")
       truthy(job.has_claim, label .. " assigned job " .. tostring(job.id) .. " has no lane claim")
+      truthy(job.field_claim, label .. " assigned job " .. tostring(job.id) .. " has no field-side claim")
+      equal(job.field_claim.job_id, job.id,
+        label .. " field-side claim references the wrong job")
+      equal(job.field_claim.machine_id, job.machine_id,
+        label .. " field-side claim references the wrong tractor")
+      equal(job.field_claim.lane, job.claim_lane,
+        label .. " job and field-side claims reference different lanes")
     else
       truthy(not job.has_claim, label .. " unassigned job " .. tostring(job.id) .. " retained a lane claim")
+      equal(job.field_claim, nil,
+        label .. " unassigned job " .. tostring(job.id) .. " retained a field-side claim")
     end
   end
   for _, machine in ipairs(snap.machines or {}) do
@@ -702,6 +711,7 @@ local function drive_fleet_verify(event)
   for _, job in ipairs({first, second, waiting}) do
     equal(job.machine_id, nil, "completed fleet job retained a tractor assignment")
     truthy(not job.has_claim, "completed fleet job retained a lane claim")
+    equal(job.field_claim, nil, "completed fleet field retained a lane claim")
   end
   equal(first.failure, nil, "first fleet field failed after load")
   equal(second.failure, nil, "second fleet field failed after load")
