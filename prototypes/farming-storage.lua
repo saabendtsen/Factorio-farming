@@ -1,7 +1,7 @@
--- The harvest destination is a real placeable container: the entity mines back
+-- The storage container is a real placeable container: the entity mines back
 -- to its own item, that item places the entity again, and one always-enabled
 -- prototype-stage recipe supplies it without debug commands. It stays a plain
--- `container`, so nearby vanilla chests remain valid harvest destinations.
+-- `container`, so nearby vanilla chests remain valid storage containers.
 local storage_container = table.deepcopy(data.raw.container["steel-chest"])
 storage_container.name = "farming-storage-container"
 storage_container.localised_name = {"entity-name.farming-storage-container"}
@@ -16,7 +16,7 @@ storage_item.localised_description = {"item-description.farming-storage-containe
 storage_item.place_result = "farming-storage-container"
 storage_item.order = "a[items]-c[farming-storage-container]"
 
--- Deliberately flat: the slice has no economy, tiers or logistics yet, so the
+-- Deliberately flat: the MVP wheat loop has no economy, tiers or logistics, so the
 -- recipe is one hand-craftable step that is enabled from the start.
 local storage_recipe = {
   type = "recipe",
