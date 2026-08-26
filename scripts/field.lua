@@ -3,7 +3,7 @@ local field = {}
 local EXPECTED_LONG = 64
 local EXPECTED_SHORT = 16
 local WORK_WIDTH = 4
-local SCHEMA_VERSION = 2
+local SCHEMA_VERSION = 3
 local GROWTH_TICKS = 60 * 60
 
 local function copy_position(position)
@@ -640,16 +640,59 @@ local function valid_legacy_field(work_field)
   return type(work_field.completed_area) == "number" and work_field.completed_area == strips_area(work_field.strips)
 end
 
+local function valid_operation_record(operation_record)
+  if type(operation_record) ~= "table" or type(operation_record.strips) ~= "table" or
+     #operation_record.strips ~= EXPECTED_SHORT or type(operation_record.area) ~= "number" then return false end
+  for index = 1, EXPECTED_SHORT do
+    if not valid_ranges(operation_record.strips[index]) then return false end
+  end
+  return operation_record.area == strips_area(operation_record.strips)
+end
+
+local function valid_crop_record(crop)
+  return type(crop) == "table" and type(crop.sow_tick) == "number" and type(crop.ready_tick) == "number" and
+    crop.ready_tick == crop.sow_tick + GROWTH_TICKS and valid_operation_record(crop)
+end
+
+local function valid_v2_field(work_field, surface_index)
+  if not valid_legacy_field(work_field) or work_field.schema_version ~= 2 or
+     type(work_field.id) ~= "number" or work_field.id < 1 or work_field.surface_index ~= surface_index or
+     type(work_field.operations) ~= "table" or type(work_field.crops) ~= "table" then return false end
+  for _, name in ipairs({"cultivation", "sowing", "harvesting"}) do
+    if not valid_operation_record(work_field.operations[name]) then return false end
+  end
+  if work_field.operations.cultivation.area ~= work_field.completed_area then return false end
+  for _, crop in ipairs(work_field.crops) do
+    if not valid_crop_record(crop) then return false end
+  end
+  return true
+end
+
+local function valid_singleton_records(state, surface_index)
+  local machine = state.machine
+  local job = state.job
+  if machine and (type(machine.id) ~= "number" or machine.id < 1 or
+      (machine.surface_index and machine.surface_index ~= surface_index)) then return false end
+  if job and (type(job.id) ~= "number" or job.id < 1 or
+      (job.field_id and job.field_id ~= state.field.id) or
+      (job.machine_id and (not machine or job.machine_id ~= machine.id))) then return false end
+  if machine and machine.job_id and (not job or machine.job_id ~= job.id) then return false end
+  return true
+end
+
 local function pause_legacy_operation(state)
   local job = state.job
-  if not job or job.state == "completed" then return end
-  job.state = "paused"
-  job.machine_id = nil
-  job.lane_claim = nil
-  job.recovery_required = true
-  job.failure = nil
-  job.paused_from = nil
-  job.paused_motion = nil
+  if job then
+    job.machine_id = nil
+    job.lane_claim = nil
+    job.paused_from = nil
+    job.paused_motion = nil
+    if job.state ~= "completed" then
+      job.state = "paused"
+      job.recovery_required = true
+      job.failure = nil
+    end
+  end
   if state.machine then
     state.machine.job_id = nil
     state.machine.generation = (state.machine.generation or 0) + 1
@@ -657,25 +700,108 @@ local function pause_legacy_operation(state)
   end
 end
 
--- Migrates only the former cultivation-only schema. Invalid records are kept
--- verbatim behind a fail-closed marker so a future repair can inspect them.
+local function fail_closed_state(root, state, surface_index, legacy, reason)
+  state.field = {migration_failed = true, legacy_raw = legacy, surface_index = surface_index}
+  state.field_ids = {}
+  state.machine_ids = {}
+  state.job_ids = {}
+  root.migration_failures[surface_index] = reason
+  pause_legacy_operation(state)
+end
+
+local function index_singleton(root, state, surface_index)
+  state.field.schema_version = SCHEMA_VERSION
+  state.field_ids = {state.field.id}
+  state.machine_ids = state.machine and {state.machine.id} or {}
+  state.job_ids = state.job and {state.job.id} or {}
+  root.fields[state.field.id] = state.field
+  if state.machine then
+    state.machine.surface_index = surface_index
+    root.machines[state.machine.id] = state.machine
+  end
+  if state.job then
+    root.jobs[state.job.id] = state.job
+  end
+end
+
+local function next_after_identifiers(value, records, observed)
+  local next_id = type(value) == "number" and value == math.floor(value) and value >= 1 and value < math.huge and value or 1
+  local function raise_for(id)
+    if type(id) == "number" and id == id and id >= 1 and id < math.huge then
+      next_id = math.max(next_id, math.floor(id) + 1)
+    end
+  end
+  for id, record in pairs(records) do
+    raise_for(id)
+    if type(record) == "table" then raise_for(record.id) end
+  end
+  for _, id in ipairs(observed) do raise_for(id) end
+  return next_id
+end
+
+local function normalize_next_ids(root, observed)
+  root.next_field_id = next_after_identifiers(root.next_field_id, root.fields, observed.field_ids)
+  root.next_machine_id = next_after_identifiers(root.next_machine_id, root.machines, observed.machine_ids)
+  root.next_job_id = next_after_identifiers(root.next_job_id, root.jobs, observed.job_ids)
+end
+
+local function remember_identity(observed, state)
+  if type(state) ~= "table" then return end
+  if type(state.field) == "table" then observed.field_ids[#observed.field_ids + 1] = state.field.id end
+  if type(state.machine) == "table" then observed.machine_ids[#observed.machine_ids + 1] = state.machine.id end
+  if type(state.job) == "table" then observed.job_ids[#observed.job_ids + 1] = state.job.id end
+end
+
+local function singleton_has_duplicate_identity(claims, state)
+  return claims.field_ids[state.field.id] > 1 or
+    (state.machine and claims.machine_ids[state.machine.id] > 1) or
+    (state.job and claims.job_ids[state.job.id] > 1)
+end
+
+-- Schema v3 retains singleton aliases for the current playable slice while
+-- indexing the same durable records in collections for a future scheduler.
+-- Invalid records are kept behind a fail-closed marker; controller recovery
+-- is never allowed to invent an assignment from malformed storage.
 function field.migrate_storage(root)
   if not root then return false, "Missing farming storage." end
-  if root.schema_version and root.schema_version >= SCHEMA_VERSION then return true end
+  if root.schema_version and root.schema_version >= SCHEMA_VERSION then
+    root.fields = root.fields or {}
+    root.machines = root.machines or {}
+    root.jobs = root.jobs or {}
+    local observed = {field_ids = {}, machine_ids = {}, job_ids = {}}
+    for _, state in pairs(root.surfaces or {}) do remember_identity(observed, state) end
+    normalize_next_ids(root, observed)
+    return true
+  end
   root.surfaces = root.surfaces or {}
   root.migration_failures = root.migration_failures or {}
+  root.fields = {}
+  root.machines = {}
+  root.jobs = {}
   root.path_queue = {}
   root.pending_paths = {}
   root.outstanding_path_id = nil
 
+  local candidates = {}
+  local observed = {field_ids = {}, machine_ids = {}, job_ids = {}}
+
   for surface_index, state in pairs(root.surfaces) do
-    local legacy = state.field
-    if legacy then
-      if not valid_legacy_field(legacy) then
-        state.field = {migration_failed = true, legacy_raw = legacy, surface_index = surface_index}
-        root.migration_failures[surface_index] = "Malformed legacy field record."
-        pause_legacy_operation(state)
-      else
+    if type(state) ~= "table" then
+      root.surfaces[surface_index] = {
+        field = {migration_failed = true, legacy_raw = state, surface_index = surface_index},
+        field_ids = {}, machine_ids = {}, job_ids = {}
+      }
+      root.migration_failures[surface_index] = "Malformed surface state."
+    else
+      local legacy = state.field
+      remember_identity(observed, state)
+      if legacy and legacy.migration_failed then
+      state.field_ids = {}
+      state.machine_ids = {}
+      state.job_ids = {}
+      pause_legacy_operation(state)
+      elseif legacy and (not root.schema_version or root.schema_version < 2) then
+      if valid_legacy_field(legacy) then
         local cultivated = {strips = copy_ranges(legacy.strips), area = legacy.completed_area}
         legacy.operations = {
           cultivation = cultivated,
@@ -683,20 +809,77 @@ function field.migrate_storage(root)
           harvesting = {strips = empty_strips(), area = 0}
         }
         legacy.crops = {}
-        legacy.schema_version = SCHEMA_VERSION
+        legacy.schema_version = 2
         legacy.strips = cultivated.strips
         legacy.completed_area = cultivated.area
         legacy.lane_claim = nil
         legacy.generation = (legacy.generation or 0) + 1
         pause_legacy_operation(state)
+        if state.job and state.job.field_id == nil then state.job.field_id = legacy.id end
+        if valid_v2_field(legacy, surface_index) and valid_singleton_records(state, surface_index) then
+          candidates[#candidates + 1] = {state = state, surface_index = surface_index, legacy = legacy}
+        else
+          fail_closed_state(root, state, surface_index, legacy, "Malformed migrated field record.")
+        end
+      else
+        fail_closed_state(root, state, surface_index, legacy, "Malformed legacy field record.")
+      end
+      elseif legacy then
+      if valid_v2_field(legacy, surface_index) and valid_singleton_records(state, surface_index) then
+        legacy.lane_claim = nil
+        legacy.generation = (legacy.generation or 0) + 1
+        pause_legacy_operation(state)
+        if state.job and state.job.field_id == nil then state.job.field_id = legacy.id end
+        candidates[#candidates + 1] = {state = state, surface_index = surface_index, legacy = legacy}
+      else
+        fail_closed_state(root, state, surface_index, legacy, "Malformed v2 field record.")
+      end
+      else
+      state.field_ids = {}
+      state.machine_ids = {}
+      state.job_ids = {}
       end
     end
   end
+  local claims = {field_ids = {}, machine_ids = {}, job_ids = {}}
+  for _, candidate in ipairs(candidates) do
+    local state = candidate.state
+    claims.field_ids[state.field.id] = (claims.field_ids[state.field.id] or 0) + 1
+    if state.machine then claims.machine_ids[state.machine.id] = (claims.machine_ids[state.machine.id] or 0) + 1 end
+    if state.job then claims.job_ids[state.job.id] = (claims.job_ids[state.job.id] or 0) + 1 end
+  end
+  for _, candidate in ipairs(candidates) do
+    if singleton_has_duplicate_identity(claims, candidate.state) then
+      fail_closed_state(root, candidate.state, candidate.surface_index, candidate.legacy,
+        "Duplicate singleton identity across surfaces.")
+    else
+      index_singleton(root, candidate.state, candidate.surface_index)
+    end
+  end
+  normalize_next_ids(root, observed)
   root.schema_version = SCHEMA_VERSION
   return true
 end
 
 field.constants = {long = EXPECTED_LONG, short = EXPECTED_SHORT, work_width = WORK_WIDTH, growth_ticks = GROWTH_TICKS}
 field._add_interval = add_interval
+
+-- The scheduler order is deliberately domain-level and independent of any
+-- controller iteration order.  A higher priority wins; ties retain the first
+-- request, with the durable job id as the final stable tie-breaker.
+function field.job_precedes(first, second)
+  local function scheduler_number(value, fallback)
+    local number = tonumber(value)
+    if not number or number ~= number or number == math.huge or number == -math.huge then return fallback end
+    return number
+  end
+  local first_priority = scheduler_number(first.priority, 0)
+  local second_priority = scheduler_number(second.priority, 0)
+  if first_priority ~= second_priority then return first_priority > second_priority end
+  local first_tick = scheduler_number(first.request_tick, 0)
+  local second_tick = scheduler_number(second.request_tick, 0)
+  if first_tick ~= second_tick then return first_tick < second_tick end
+  return scheduler_number(first.id, 0) < scheduler_number(second.id, 0)
+end
 
 return field

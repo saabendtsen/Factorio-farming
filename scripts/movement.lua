@@ -97,9 +97,9 @@ function movement.invalidate(machine)
 end
 
 local function find_machine(machine_id, surface_index)
-  local surface_state = storage.farming.surfaces[surface_index]
-  local machine = surface_state and surface_state.machine
-  if machine and machine.id == machine_id then return machine end
+  local root = storage.farming
+  local machine = root and root.machines and root.machines[machine_id]
+  if machine and machine.surface_index == surface_index then return machine end
   return nil
 end
 

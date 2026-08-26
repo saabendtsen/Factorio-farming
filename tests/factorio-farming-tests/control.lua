@@ -29,6 +29,14 @@ local function write_result(name, result)
 end
 
 local function run_pure_tests()
+  local low_priority = {id = 4, priority = 1, request_tick = 10}
+  local high_priority = {id = 5, priority = 2, request_tick = 20}
+  local earlier_request = {id = 6, priority = 2, request_tick = 19}
+  local same_request_lower_id = {id = 3, priority = 2, request_tick = 19}
+  truthy(field.job_precedes(high_priority, low_priority), "higher-priority job is dispatched first")
+  truthy(field.job_precedes(earlier_request, high_priority), "earlier equal-priority request is dispatched first")
+  truthy(field.job_precedes(same_request_lower_id, earlier_request), "job id stabilizes equal requests")
+
   local horizontal, horizontal_error = field.normalize_selection({
     left_top = {x = 0, y = 0}, right_bottom = {x = 64, y = 16}
   })
@@ -187,7 +195,7 @@ local function run_pure_tests()
       machine = {id = 1, job_id = 1, controller = {state = "working"}}}}
   }
   truthy(field.migrate_storage(root), "legacy storage migration")
-  equal(root.schema_version, 2, "storage schema version")
+  equal(root.schema_version, 3, "storage schema version")
   equal(field.operation_area(root.surfaces[1].field, "cultivation"), 256, "legacy coverage converts exactly")
   equal(field.operation_area(root.surfaces[1].field, "sowing"), 0, "migration invents no sowing")
   equal(#root.surfaces[1].field.crops, 0, "migration invents no crops")
@@ -196,6 +204,129 @@ local function run_pure_tests()
   equal(root.surfaces[1].job.paused_motion, nil, "legacy controller motion discarded")
   equal(#root.path_queue, 0, "legacy queued paths discarded")
   equal(next(root.pending_paths), nil, "legacy pending paths discarded")
+
+  -- Schema v3 introduces durable collections without changing the current
+  -- one-field player experience. The singleton records remain the public
+  -- compatibility aliases while their identities are indexed for a later
+  -- scheduler to use.
+  local singleton_field = field.create(12, 2, horizontal, {x = -10, y = 8})
+  singleton_field.schema_version = 2
+  local singleton_root = {
+    schema_version = 2,
+    next_field_id = 13,
+    next_machine_id = 8,
+    next_job_id = 10,
+    surfaces = {[2] = {
+      field = singleton_field,
+      machine = {id = 7, surface_index = 2, job_id = 9, controller = {state = "working", recoveries = 2}},
+      job = {id = 9, machine_id = 7, state = "working", operation = "cultivation", lane_claim = 1,
+        paused_motion = {remaining_waypoints = {{x = 1, y = 1}}}}
+    }}
+  }
+  truthy(field.migrate_storage(singleton_root), "v2 singleton storage migration")
+  equal(singleton_root.schema_version, 3, "v2 storage reaches schema v3")
+  equal(singleton_root.fields[12], singleton_root.surfaces[2].field, "field collection preserves singleton identity")
+  equal(singleton_root.machines[7], singleton_root.surfaces[2].machine, "machine collection preserves singleton identity")
+  equal(singleton_root.jobs[9], singleton_root.surfaces[2].job, "job collection preserves singleton identity")
+  equal(singleton_root.surfaces[2].field_ids[1], 12, "surface indexes its field")
+  equal(singleton_root.surfaces[2].machine_ids[1], 7, "surface indexes its machine")
+  equal(singleton_root.surfaces[2].job_ids[1], 9, "surface indexes its job")
+  equal(singleton_root.surfaces[2].job.state, "paused", "v2 active job requires explicit recovery")
+  equal(singleton_root.surfaces[2].job.machine_id, nil, "v2 active assignment is discarded")
+  equal(singleton_root.surfaces[2].machine.controller.state, "idle", "v2 controller motion is discarded")
+  truthy(field.migrate_storage(singleton_root), "v3 migration is idempotent")
+  equal(singleton_root.fields[12], singleton_root.surfaces[2].field, "idempotence retains field identity")
+
+  local missing_field_id = field.create(14, 4, horizontal, {x = -10, y = 8})
+  missing_field_id.schema_version = 2
+  local missing_field_id_root = {schema_version = 2, surfaces = {[4] = {
+    field = missing_field_id,
+    job = {id = 11, state = "waiting", operation = "cultivation"}
+  }}}
+  truthy(field.migrate_storage(missing_field_id_root), "missing job field identity migration")
+  equal(missing_field_id_root.surfaces[4].job.field_id, 14, "migration backfills singleton job field identity")
+
+  local corrupt_counter_root = {
+    schema_version = 2,
+    next_field_id = 0,
+    next_machine_id = 1.5,
+    next_job_id = "none",
+    surfaces = {[5] = {field = {migration_failed = true}}}
+  }
+  truthy(field.migrate_storage(corrupt_counter_root), "corrupt counter migration")
+  equal(corrupt_counter_root.next_field_id, 1, "empty corrupt field counter normalizes to a positive integer")
+  equal(corrupt_counter_root.next_machine_id, 1, "empty corrupt machine counter normalizes to a positive integer")
+  equal(corrupt_counter_root.next_job_id, 1, "empty corrupt job counter normalizes to a positive integer")
+
+  local first_duplicate = field.create(20, 6, horizontal, {x = -10, y = 8})
+  local second_duplicate = field.create(20, 7, horizontal, {x = -10, y = 8})
+  first_duplicate.schema_version = 2
+  second_duplicate.schema_version = 2
+  local duplicate_root = {schema_version = 2, next_field_id = 1, next_machine_id = 1, next_job_id = 1, surfaces = {
+    [6] = {field = first_duplicate, machine = {id = 30}, job = {id = 40, state = "waiting"}},
+    [7] = {field = second_duplicate, machine = {id = 30}, job = {id = 40, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(duplicate_root), "duplicate singleton migration")
+  truthy(duplicate_root.surfaces[6].field.migration_failed, "first duplicate surface fails closed")
+  truthy(duplicate_root.surfaces[7].field.migration_failed, "second duplicate surface fails closed")
+  equal(next(duplicate_root.fields), nil, "duplicate fields do not overwrite the scheduler collection")
+  equal(next(duplicate_root.machines), nil, "duplicate machines do not overwrite the scheduler collection")
+  equal(next(duplicate_root.jobs), nil, "duplicate jobs do not overwrite the scheduler collection")
+  equal(duplicate_root.next_field_id, 21, "field counter advances beyond duplicate identities")
+  equal(duplicate_root.next_machine_id, 31, "machine counter advances beyond duplicate identities")
+  equal(duplicate_root.next_job_id, 41, "job counter advances beyond duplicate identities")
+
+  local machine_duplicate_first = field.create(22, 9, horizontal, {x = -10, y = 8})
+  local machine_duplicate_second = field.create(23, 10, horizontal, {x = -10, y = 8})
+  machine_duplicate_first.schema_version = 2
+  machine_duplicate_second.schema_version = 2
+  local machine_duplicate_root = {schema_version = 2, surfaces = {
+    [9] = {field = machine_duplicate_first, machine = {id = 60}, job = {id = 61, state = "waiting"}},
+    [10] = {field = machine_duplicate_second, machine = {id = 60}, job = {id = 62, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(machine_duplicate_root), "duplicate machine singleton migration")
+  truthy(machine_duplicate_root.surfaces[9].field.migration_failed, "first duplicate machine surface fails closed")
+  truthy(machine_duplicate_root.surfaces[10].field.migration_failed, "second duplicate machine surface fails closed")
+  equal(next(machine_duplicate_root.machines), nil, "duplicate machines do not overwrite the scheduler collection")
+
+  local job_duplicate_first = field.create(24, 11, horizontal, {x = -10, y = 8})
+  local job_duplicate_second = field.create(25, 12, horizontal, {x = -10, y = 8})
+  job_duplicate_first.schema_version = 2
+  job_duplicate_second.schema_version = 2
+  local job_duplicate_root = {schema_version = 2, surfaces = {
+    [11] = {field = job_duplicate_first, machine = {id = 70}, job = {id = 71, state = "waiting"}},
+    [12] = {field = job_duplicate_second, machine = {id = 72}, job = {id = 71, state = "waiting"}}
+  }}
+  truthy(field.migrate_storage(job_duplicate_root), "duplicate job singleton migration")
+  truthy(job_duplicate_root.surfaces[11].field.migration_failed, "first duplicate job surface fails closed")
+  truthy(job_duplicate_root.surfaces[12].field.migration_failed, "second duplicate job surface fails closed")
+  equal(next(job_duplicate_root.jobs), nil, "duplicate jobs do not overwrite the scheduler collection")
+
+  local completed_field = field.create(50, 8, horizontal, {x = -10, y = 8})
+  completed_field.schema_version = 2
+  local completed_root = {schema_version = 2, surfaces = {[8] = {
+    field = completed_field,
+    machine = {id = 51, job_id = 52, controller = {state = "working"}},
+    job = {id = 52, field_id = 50, machine_id = 51, state = "completed", lane_claim = 1,
+      paused_motion = {remaining_waypoints = {{x = 1, y = 1}}}}
+  }}}
+  truthy(field.migrate_storage(completed_root), "completed singleton migration")
+  equal(completed_root.surfaces[8].job.state, "completed", "completed job retains completion status")
+  equal(completed_root.surfaces[8].job.machine_id, nil, "completed job assignment is discarded")
+  equal(completed_root.surfaces[8].job.lane_claim, nil, "completed job lane claim is discarded")
+  equal(completed_root.surfaces[8].machine.job_id, nil, "completed machine assignment is discarded")
+  equal(completed_root.surfaces[8].machine.controller.state, "idle", "completed machine controller is discarded")
+
+  local malformed_v2_root = {schema_version = 2, surfaces = {[3] = {field = {
+    id = 13, schema_version = 2, surface_index = 3, bounds = horizontal, axis = "x",
+    operations = {cultivation = {strips = {{{8, 4}}}, area = 0}}
+  }, job = {id = 10, state = "working", machine_id = 8, lane_claim = 1},
+  machine = {id = 8, job_id = 10, generation = 2, controller = {state = "working"}}}}}
+  truthy(field.migrate_storage(malformed_v2_root), "malformed v2 migration completes fail-closed conversion")
+  truthy(malformed_v2_root.surfaces[3].field.migration_failed, "malformed v2 field fails closed")
+  equal(malformed_v2_root.surfaces[3].job.state, "paused", "malformed v2 job is disabled")
+  equal(malformed_v2_root.surfaces[3].machine.job_id, nil, "malformed v2 machine assignment cleared")
+  equal(next(malformed_v2_root.fields), nil, "malformed v2 field is excluded from scheduler collection")
 
   local malformed_root = {schema_version = 1, surfaces = {[1] = {field = {
     id = 9, surface_index = 1, bounds = horizontal, axis = "x", strips = {{{8, 4}}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
@@ -220,8 +351,8 @@ end
 
 local function build_surface(name)
   local surface = game.create_surface("farming-production-slice-test-" .. name, {
-    width = 256,
-    height = 256,
+    width = 384,
+    height = 128,
     peaceful_mode = true,
     autoplace_controls = {}
   })
@@ -229,8 +360,8 @@ local function build_surface(name)
   surface.request_to_generate_chunks({x = 0, y = 0}, 4)
   surface.force_generate_chunk_requests()
   local test_tiles = {}
-  for y = -32, 31 do
-    for x = -32, 95 do
+  for y = -32, 95 do
+    for x = -32, 351 do
       test_tiles[#test_tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
     end
   end
@@ -254,6 +385,229 @@ end
 
 local function snapshot(surface_index)
   return remote.call("factorio_farming", "snapshot", surface_index)
+end
+
+local function queued_job(snap, id)
+  for _, job in ipairs(snap.queued_jobs or {}) do
+    if job.id == id then return job end
+  end
+  return nil
+end
+
+local function init_queue()
+  local surface = build_surface("queue")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "queue tractor setup failed")
+  local rejected, rejection = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 32, top = 0, right = 96, bottom = 16}, 0, "cultivation")
+  truthy(not rejected and string.find(rejection or "", "overlap"), "overlapping queue field rejected")
+  rejected, rejection = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 0, right = 144, bottom = 16}, 0, "not-an-operation")
+  truthy(not rejected and string.find(rejection or "", "compatible"), "unsupported queue operation rejected")
+  local queued, queue_error, high_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "high-priority field queue failed")
+  storage.queue_high_id = high_id
+  queued, queue_error, storage.queue_pause_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 5, "cultivation")
+  truthy(queued, queue_error or "pause field queue failed")
+  queued, queue_error, storage.queue_failed_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 32, right = 144, bottom = 48}, -1, "cultivation")
+  truthy(queued, queue_error or "failed field queue failed")
+  storage.queue_surface = surface.index
+  storage.queue_started = false
+  storage.queue_paused = false
+  storage.queue_resumed = false
+  storage.queue_destroyed = false
+  storage.queue_deadline = game.tick + 99999
+end
+
+local function drive_queue(event)
+  local snap = snapshot(storage.queue_surface)
+  local high = queued_job(snap, storage.queue_high_id)
+  local paused = queued_job(snap, storage.queue_pause_id)
+  local failed = queued_job(snap, storage.queue_failed_id)
+  truthy(high and paused and failed, "queued jobs remain durably visible")
+  if not storage.queue_started and snap.job and snap.job.machine_id then
+    equal(snap.job.id, storage.queue_high_id, "highest priority dispatches first")
+    storage.queue_started = true
+  end
+  if high.state == "completed" and paused.state == "working" and not storage.queue_paused then
+    truthy(remote.call("factorio_farming", "debug_pause", storage.queue_surface), "queued field pauses")
+    storage.queue_paused = true
+  elseif storage.queue_paused and not storage.queue_resumed and paused.state == "paused" then
+    truthy(remote.call("factorio_farming", "debug_resume", storage.queue_surface), "queued field resumes")
+    storage.queue_resumed = true
+  end
+  if paused.state == "completed" and failed.state == "working" and not storage.queue_destroyed then
+    truthy(remote.call("factorio_farming", "debug_destroy_tractor", storage.queue_surface), "queued tractor destruction")
+    storage.queue_destroyed = true
+  end
+  if high.state == "completed" and paused.state == "completed" and failed.state == "failed" then
+    equal(high.completed_area, 1024, "high-priority field exact coverage")
+    equal(paused.completed_area, 1024, "paused field resumes without skipped or duplicate coverage")
+    equal(failed.completed_area, 0, "destroyed tractor leaves unstarted coverage for retry")
+    truthy(storage.queue_paused and storage.queue_resumed, "pause does not requeue the job")
+    truthy(storage.queue_destroyed and failed.machine_id == nil, "failed job is released but never requeued")
+    write_result("queue", {passed = true, high_id = high.id, paused_id = paused.id, failed_id = failed.id})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= storage.queue_deadline then
+    write_result("queue", {passed = false, snapshot = snap})
+    fail("queue scheduler timeout")
+  end
+end
+
+-- Two tractors must take the two highest-priority distinct fields at once;
+-- the third field stays queued.  This is deliberately expressed only through
+-- the mod's debug setup/queue/snapshot seams, not storage internals.
+local function init_fleet()
+  local surface = build_surface("fleet")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "fleet primary tractor setup failed")
+  ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, {x = -20, y = 40})
+  truthy(ok, message or "fleet secondary tractor setup failed")
+  local queued, queue_error, first_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 20, "cultivation")
+  truthy(queued, queue_error or "fleet first field queue failed")
+  queued, queue_error, storage.fleet_second_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "fleet second field queue failed")
+  queued, queue_error, storage.fleet_waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 80, top = 32, right = 144, bottom = 48}, 5, "cultivation")
+  truthy(queued, queue_error or "fleet waiting field queue failed")
+  storage.fleet_surface = surface.index
+  storage.fleet_first_id = first_id
+  storage.fleet_initial_dispatch_seen = false
+  storage.fleet_concurrent_work_seen = false
+  storage.fleet_deadline = game.tick + 29999
+end
+
+local function drive_fleet(event)
+  local snap = snapshot(storage.fleet_surface)
+  local first = queued_job(snap, storage.fleet_first_id)
+  local second = queued_job(snap, storage.fleet_second_id)
+  local waiting = queued_job(snap, storage.fleet_waiting_id)
+  truthy(first and second and waiting, "fleet jobs remain visible")
+  if not storage.fleet_initial_dispatch_seen and first.machine_id and second.machine_id then
+    truthy(first.machine_id ~= second.machine_id, "two tractors receive distinct field jobs")
+    equal(waiting.state, "waiting", "third-priority field remains queued")
+    equal(waiting.machine_id, nil, "third-priority field remains unassigned")
+    truthy(#(snap.machines or {}) == 2, "fleet snapshot exposes both tractors")
+    storage.fleet_initial_dispatch_seen = true
+  end
+  if first.state == "working" and second.state == "working" then
+    storage.fleet_concurrent_work_seen = true
+  end
+  if storage.fleet_initial_dispatch_seen and storage.fleet_concurrent_work_seen and
+     first.state == "completed" and second.state == "completed" and waiting.machine_id then
+    equal(first.completed_area, 1024, "first fleet field completes exact coverage")
+    equal(second.completed_area, 1024, "second fleet field completes exact coverage")
+    write_result("fleet", {passed = true, first_id = first.id, second_id = second.id, waiting_id = waiting.id,
+      machine_ids = {first.machine_id, second.machine_id}, third_machine_id = waiting.machine_id})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= storage.fleet_deadline then
+    write_result("fleet", {passed = false, snapshot = snap})
+    fail("two-tractor dispatch timeout")
+  end
+end
+
+-- ---------------------------------------------------------------- queue save/load
+
+-- A queue save must contain both sides of the scheduler boundary: an assigned
+-- field already doing work and a distinct waiting field.  This deliberately
+-- uses only the public debug queue and snapshot interfaces so the acceptance
+-- test remains valid when the scheduler storage is refactored.
+local function init_queue_capture()
+  local surface = build_surface("queue-capture")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "queue save capture tractor setup failed")
+
+  local queued, queue_error, active_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 160, top = 0, right = 224, bottom = 16}, 10, "cultivation")
+  truthy(queued, queue_error or "queue save capture active field failed")
+  queued, queue_error, waiting_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+    {left = 240, top = 0, right = 304, bottom = 16}, 5, "cultivation")
+  truthy(queued, queue_error or "queue save capture waiting field failed")
+
+  storage.queue_capture = {
+    surface = surface.index,
+    active_id = active_id,
+    waiting_id = waiting_id,
+    deadline = game.tick + 30000
+  }
+end
+
+local function drive_queue_capture(event)
+  local capture = storage.queue_capture
+  local snap = snapshot(capture.surface)
+  local active = queued_job(snap, capture.active_id)
+  local waiting = queued_job(snap, capture.waiting_id)
+  truthy(active and waiting, "queue save capture lost durable jobs")
+
+  if active.state == "working" and active.completed_area >= 64 then
+    equal(snap.job.id, capture.active_id, "queue save capture assigned wrong field")
+    equal(active.machine_id, snap.machine.id, "queue save capture active assignment")
+    equal(waiting.state, "waiting", "queue save capture waiting field dispatched early")
+    equal(waiting.machine_id, nil, "queue save capture waiting field assigned early")
+    storage.test_capture = "queue-working"
+    storage.capture_surface = capture.surface
+    storage.queue_capture_active_id = active.id
+    storage.queue_capture_waiting_id = waiting.id
+    storage.queue_capture_active_area = active.completed_area
+    storage.queue_capture_waiting_area = waiting.completed_area
+    game.auto_save("queue-working")
+    write_result("queue-capture", {passed = true, saved = {"queue-working"}, tick = event.tick})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= capture.deadline then
+    write_result("queue-capture", {passed = false, snapshot = snap})
+    fail("queue save capture timeout")
+  end
+end
+
+local queue_verify = {}
+
+local function drive_queue_verify(event)
+  local surface = storage.capture_surface
+  local snap = snapshot(surface)
+  local active = queued_job(snap, storage.queue_capture_active_id)
+  local waiting = queued_job(snap, storage.queue_capture_waiting_id)
+  truthy(active and waiting, "queue save/load lost a queued job")
+
+  if not queue_verify.started then
+    queue_verify.started = event.tick
+    equal(snap.job.id, storage.queue_capture_active_id, "queue load selected the wrong active field")
+    equal(active.state, "working", "queue working field did not remain working after load")
+    equal(active.completed_area, storage.queue_capture_active_area,
+      "queue load changed active authoritative coverage")
+    equal(waiting.state, "waiting", "queue waiting field did not remain queued after load")
+    equal(waiting.machine_id, nil, "queue waiting field was assigned after load")
+    equal(waiting.completed_area, storage.queue_capture_waiting_area,
+      "queue load changed waiting authoritative coverage")
+    truthy(snap.machine.generation > 1, "queue load did not invalidate saved controller")
+    return
+  end
+
+  if event.tick - queue_verify.started > 30000 then
+    write_result("saveload-queue-working", {passed = false, snapshot = snap})
+    fail("queue save/load replay timeout")
+  end
+
+  if active.state ~= "completed" or waiting.state ~= "completed" then return end
+  equal(active.completed_area, 1024, "queue active field completed exact coverage after load")
+  equal(waiting.completed_area, 1024, "queue waiting field completed exact coverage after load")
+  equal(waiting.failure, nil, "queue waiting field failed instead of dispatching after load")
+  equal(snap.machine.job_id, nil, "queue machine retained assignment after both fields completed")
+  equal(snap.pending_path_count, 0, "queue replay left a pending path")
+  write_result("saveload-queue-working", {
+    passed = true,
+    active_completed_area = active.completed_area,
+    waiting_completed_area = waiting.completed_area,
+    ticks_after_load = event.tick - queue_verify.started
+  })
+  script.on_event(defines.events.on_tick, nil)
 end
 
 local function run_contextual_action_tests()
@@ -814,6 +1168,12 @@ script.on_init(function()
     init_cycle()
   elseif mode == "functional" then
     init_functional()
+  elseif mode == "queue" then
+    init_queue()
+  elseif mode == "fleet" then
+    init_fleet()
+  elseif mode == "queue-capture" then
+    init_queue_capture()
   else
     fail("mode '" .. tostring(mode) .. "' does not create a map")
   end
@@ -828,6 +1188,14 @@ script.on_event(defines.events.on_tick, function(event)
     drive_cycle(event)
   elseif mode == "replay" then
     drive_replay(event)
+  elseif mode == "queue" then
+    drive_queue(event)
+  elseif mode == "fleet" then
+    drive_fleet(event)
+  elseif mode == "queue-capture" then
+    drive_queue_capture(event)
+  elseif mode == "queue-replay" then
+    drive_queue_verify(event)
   else
     drive_functional(event)
   end

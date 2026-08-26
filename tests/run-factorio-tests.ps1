@@ -140,6 +140,72 @@ else {
 
 # ----------------------------------------------------------- crop capture
 
+Write-Stage "Shared queue scheduler acceptance flow"
+Set-TestMode "queue"
+$queueSave = Join-Path $RunRoot "queue-test.zip"
+Invoke-Factorio "queue-create" @("--create", $queueSave) | Out-Null
+if (-not (Test-Path $queueSave)) { Write-Fail "queue map creation" }
+else {
+  Invoke-Factorio "queue" @("--benchmark", $queueSave, "--benchmark-ticks", "100000", "--benchmark-runs", "1") | Out-Null
+  $queue = Get-Result "queue"
+  if ($queue -and $queue.passed) {
+    Write-Pass "shared queue: priority dispatch, pause/resume, and release completed"
+  } else {
+    Write-Fail "shared queue scheduler"
+    Show-ScriptError "queue"
+  }
+}
+
+Write-Stage "Two-tractor fleet dispatch acceptance flow"
+Set-TestMode "fleet"
+$fleetSave = Join-Path $RunRoot "fleet-test.zip"
+Invoke-Factorio "fleet-create" @("--create", $fleetSave) | Out-Null
+if (-not (Test-Path $fleetSave)) { Write-Fail "fleet map creation" }
+else {
+  Invoke-Factorio "fleet" @("--benchmark", $fleetSave, "--benchmark-ticks", "30000", "--benchmark-runs", "1") | Out-Null
+  $fleet = Get-Result "fleet"
+  if ($fleet -and $fleet.passed) { Write-Pass "two-tractor fleet: distinct priority fields dispatched concurrently" }
+  else { Write-Fail "two-tractor fleet dispatch"; Show-ScriptError "fleet" }
+}
+
+Write-Stage "Shared queue save/load capture"
+Set-TestMode "queue-capture"
+$queueCaptureSave = Join-Path $RunRoot "queue-capture.zip"
+Invoke-Factorio "queue-capture-create" @("--create", $queueCaptureSave) | Out-Null
+
+$capturedQueuePhases = @()
+if (-not (Test-Path $queueCaptureSave)) {
+  Write-Fail "queue save/load capture map creation"
+} else {
+  $queueCaptureResultPath = Join-Path $OutputRoot "queue-capture.json"
+  $proc = Start-Process -FilePath $FactorioExe -PassThru `
+    -ArgumentList @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
+                    "--start-server", $queueCaptureSave,
+                    "--server-settings", (Join-Path $RunRoot "server-settings.json")) `
+    -RedirectStandardOutput (Join-Path $LogRoot "queue-capture.stdout.log") `
+    -RedirectStandardError (Join-Path $LogRoot "queue-capture.stderr.log")
+
+  $deadline = (Get-Date).AddMinutes(4)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path $queueCaptureResultPath) { break }
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  Start-Sleep -Seconds 2
+  if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
+  Start-Sleep -Seconds 1
+  Save-StageLog "queue-capture" | Out-Null
+
+  $queueCapture = Get-Result "queue-capture"
+  if ($queueCapture -and $queueCapture.passed) {
+    $capturedQueuePhases = @($queueCapture.saved)
+    Write-Pass "captured queue phases: $($capturedQueuePhases -join ', ')"
+  } else {
+    Write-Fail "queue save/load capture"
+    Show-ScriptError "queue-capture"
+  }
+}
+
 Write-Stage "Crop cycle save/load capture"
 Set-TestMode "cycle-capture"
 $cycleCaptureSave = Join-Path $RunRoot "cycle-capture.zip"
@@ -254,6 +320,26 @@ foreach ($phase in @("sowing", "harvesting")) {
     Show-ScriptError "saveload-cycle-$phase"
   }
 }
+
+foreach ($phase in @("queue-working")) {
+  if ($capturedQueuePhases -notcontains $phase) { Write-Fail "queue save/load $phase (no save captured)"; continue }
+  $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*${phase}.zip" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $save) { Write-Fail "queue save/load $phase (save file missing)"; continue }
+  Set-TestMode "queue-replay"
+  Invoke-Factorio "saveload-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", "40000", "--benchmark-runs", "1") | Out-Null
+  $result = Get-Result "saveload-$phase"
+  if ($result -and $result.passed) {
+    Write-Pass "queue save/load ${phase}: active and waiting fields completed exactly"
+  } else {
+    Write-Fail "queue save/load $phase"
+    Show-ScriptError "saveload-$phase"
+  }
+}
+
+# The performance reference save is driven by the ordinary replay dispatcher.
+# Queue replay is a dedicated mode and must not leak into that later stage.
+Set-TestMode "replay"
 
 # ---------------------------------------------------------------- benchmark
 
