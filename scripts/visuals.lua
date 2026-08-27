@@ -6,6 +6,13 @@ local visuals = {}
 -- depends on the total number of fields waiting behind the current work.
 local MAX_PROJECTIONS_PER_TICK = 8
 local MAX_FIELDS_PER_TICK = 8
+local IMPLEMENT_OVERLAY_SPECS = {
+  cultivation = {badge_sprite = "item/iron-gear-wheel", tint = {0.55, 0.24, 0.08, 0.92}},
+  sowing = {badge_sprite = "item/wood", tint = {0.20, 0.75, 0.25, 0.92}},
+  harvesting = {badge_sprite = "item/steel-chest", tint = {0.95, 0.65, 0.08, 0.92}}
+}
+local PIXELS_PER_TILE = 32
+local WIDTH_BAR_SPRITE_PIXELS = 10
 
 local function enqueue(state, field_id)
   if state.visual_queued[field_id] then return end
@@ -35,6 +42,7 @@ local function root()
   state.visual_summaries = state.visual_summaries or {}
   state.visual_dirty = state.visual_dirty or {}
   state.visual_builds = state.visual_builds or {}
+  state.machine_overlays = state.machine_overlays or {}
   state.visual_queued = state.visual_queued or {}
   state.visual_queue_next = state.visual_queue_next or {}
   if not state.visual_queue_initialized then
@@ -65,6 +73,75 @@ end
 local function destroy_objects(objects)
   for _, object in ipairs(objects or {}) do
     if object.valid then object.destroy() end
+  end
+end
+
+local function destroy_machine_overlay(state, machine_id)
+  local overlay = state.machine_overlays[machine_id]
+  if overlay then destroy_objects(overlay.objects) end
+  state.machine_overlays[machine_id] = nil
+end
+
+local function valid_object_count(objects)
+  local count = 0
+  for _, object in ipairs(objects or {}) do
+    if object.valid then count = count + 1 end
+  end
+  return count
+end
+
+-- Machine overlays are attached rendering projections. Assignment and logical
+-- implement profiles remain authoritative; these objects can always be thrown
+-- away and reconstructed from machine.job_id -> job.operation.
+function visuals.sync_machine(machine, job, entity)
+  local state = root()
+  local operation = machine and machine.job_id and job and job.machine_id == machine.id and
+    job.state ~= "failed" and job.state ~= "completed" and job.operation or nil
+  local spec = operation and IMPLEMENT_OVERLAY_SPECS[operation]
+  local implement = spec and machine.implements and machine.implements[operation]
+  local work_width = implement and implement.work_width
+  local existing = machine and state.machine_overlays[machine.id]
+  if existing and existing.operation == operation and existing.work_width == work_width and
+     valid_object_count(existing.objects) == 2 and
+     entity and entity.valid and existing.target_unit_number == entity.unit_number then
+    return true
+  end
+  if machine then destroy_machine_overlay(state, machine.id) end
+  if not machine or not spec or not work_width or not entity or not entity.valid then return false end
+
+  local width_bar = rendering.draw_sprite({sprite = "utility/white_square", target = entity,
+    orientation_target = entity, use_target_orientation = true, oriented_offset = {0, 1.8},
+    surface = entity.surface, render_layer = "entity-info-icon",
+    x_scale = work_width * PIXELS_PER_TILE / WIDTH_BAR_SPRITE_PIXELS, y_scale = 1.6, tint = spec.tint})
+  local badge = rendering.draw_sprite({sprite = spec.badge_sprite, target = entity,
+    orientation_target = entity, use_target_orientation = true, oriented_offset = {0, 0},
+    surface = entity.surface, render_layer = "entity-info-icon", x_scale = 0.55, y_scale = 0.55})
+  state.machine_overlays[machine.id] = {operation = operation, objects = {width_bar, badge},
+    target_unit_number = entity.unit_number, badge_sprite = spec.badge_sprite, work_width = work_width}
+  return true
+end
+
+function visuals.machine_overlay(machine_id)
+  local overlay = root().machine_overlays[machine_id]
+  if not overlay or valid_object_count(overlay.objects) ~= 2 then return nil end
+  return {operation = overlay.operation, object_count = 2, work_width = overlay.work_width,
+    target_unit_number = overlay.target_unit_number, badge_sprite = overlay.badge_sprite,
+    object_ids = {overlay.objects[1].id, overlay.objects[2].id}}
+end
+
+function visuals.reset_machine_overlays(machines, jobs, surface_index)
+  local state = root()
+  local ids = {}
+  for machine_id, machine in pairs(machines or {}) do
+    if not surface_index or machine.surface_index == surface_index then ids[#ids + 1] = machine_id end
+  end
+  table.sort(ids)
+  for _, machine_id in ipairs(ids) do destroy_machine_overlay(state, machine_id) end
+  for _, machine_id in ipairs(ids) do
+    local machine = machines[machine_id]
+    local entity = machine.unit_number and game.get_entity_by_unit_number(machine.unit_number) or nil
+    local job = machine.job_id and jobs and jobs[machine.job_id] or nil
+    visuals.sync_machine(machine, job, entity)
   end
 end
 
@@ -202,7 +279,7 @@ end
 
 -- Reset work may scale with all fields, but it runs only at load/configuration
 -- boundaries. It sorts once, then ordinary tick scheduling stays bounded.
-function visuals.reset(fields)
+function visuals.reset(fields, machines, jobs)
   local state = root()
   for field_id in pairs(state.visuals) do destroy_objects(state.visuals[field_id]) end
   for _, build in pairs(state.visual_builds) do destroy_objects(build.objects) end
@@ -215,12 +292,16 @@ function visuals.reset(fields)
   state.visual_queue_head = nil
   state.visual_queue_tail = nil
   state.visual_queue_initialized = true
+  local overlay_ids = {}
+  for machine_id in pairs(state.machine_overlays) do overlay_ids[#overlay_ids + 1] = machine_id end
+  for _, machine_id in ipairs(overlay_ids) do destroy_machine_overlay(state, machine_id) end
   local ids = {}
   for field_id, work_field in pairs(fields or {}) do
     if not work_field.migration_failed then ids[#ids + 1] = field_id end
   end
   table.sort(ids)
   for _, field_id in ipairs(ids) do visuals.mark_dirty(fields[field_id]) end
+  visuals.reset_machine_overlays(machines, jobs)
 end
 
 function visuals.is_dirty(field_id)
