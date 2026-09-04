@@ -6,6 +6,11 @@ local slice = {}
 local load_recovery_needed = false
 local recovered_job_areas = nil
 local profile = nil
+-- Ephemeral observations for the production scale harness. Field, job, and
+-- machine records remain authoritative; this only reports the last scheduler
+-- tick and is never used to resume work after a load.
+local last_tick_telemetry = {controller_due = 0, controller_updated_machine_id = nil,
+  path_queue_depth = 0, outstanding_paths = 0}
 local start_lane
 local complete_job
 local finish_lane
@@ -494,6 +499,8 @@ end
 
 function slice.on_load()
   load_recovery_needed = true
+  last_tick_telemetry = {controller_due = 0, controller_updated_machine_id = nil,
+    path_queue_depth = 0, outstanding_paths = 0}
 end
 
 -- Path requests never survive a save. Every in-flight request is dropped and the
@@ -854,6 +861,10 @@ start_next_operation = function(state, player)
   job.implement = operation_name
   job.state = "waiting"
   job.failure = nil
+  -- The initial player-visible field is reserved immediately, unlike queued
+  -- fleet jobs. Keep the same request timestamp so the production scale ledger
+  -- can measure dispatch latency across both paths.
+  job.request_tick = game.tick
   job.generation = job.generation + 1
   job.player_index = player and player.index or job.player_index
   local surface = state.surface or surface_state(state.field.surface_index)
@@ -1043,6 +1054,8 @@ local function tick_body(event)
   local root = ensure_root()
   dispatch_queued_jobs(root)
   promote_reserved(root)
+  local queued_paths_before = #root.path_queue
+  local outstanding_before = root.outstanding_path_id and 1 or 0
   movement.process_path_queue(event.tick)
   local due = {}
   local active = 0
@@ -1062,6 +1075,7 @@ local function tick_body(event)
     end
   end
   table.sort(due, function(a, b) return a.machine.id < b.machine.id end)
+  local updated_machine_id = nil
   if #due > 0 then
     local selected = due[1]
     for _, candidate in ipairs(due) do
@@ -1071,6 +1085,7 @@ local function tick_body(event)
       end
     end
     root.last_controller_machine_id = selected.machine.id
+    updated_machine_id = selected.machine.id
     handle_outcome(selected, movement.update(selected.machine, event.tick))
     finish_arrived_harvest_lane(selected)
   end
@@ -1079,6 +1094,8 @@ local function tick_body(event)
     if state then finish_arrived_harvest_lane(state) end
   end
   visuals.update()
+  last_tick_telemetry = {controller_due = #due, controller_updated_machine_id = updated_machine_id,
+    path_queue_depth = queued_paths_before, outstanding_paths = outstanding_before}
   return active
 end
 
@@ -1263,7 +1280,50 @@ function slice.snapshot(surface_index)
   local job = state.job
   local machine = state.machine
   local storage_inventory = work_field and destination_inventory(state)
+  local all_jobs = {}
+  local owned_machine_count = 0
+  local active_machine_count = 0
+  local visual_object_count = 0
+  local dirty_field_count = 0
+  for _, fleet_machine in pairs(root.machines) do
+    if fleet_machine.surface_index == surface_index then
+      if movement.entity(fleet_machine) then owned_machine_count = owned_machine_count + 1 end
+      local fleet_job = fleet_machine.job_id and root.jobs[fleet_machine.job_id]
+      if fleet_job and fleet_job.state ~= "paused" and fleet_job.state ~= "failed" and
+         fleet_job.state ~= "completed" then active_machine_count = active_machine_count + 1 end
+      local overlay = visuals.machine_overlay(fleet_machine.id)
+      visual_object_count = visual_object_count + (overlay and overlay.object_count or 0)
+    end
+  end
+  for _, live in pairs(root.fields) do
+    if live.surface_index == surface_index and not live.migration_failed then
+      visual_object_count = visual_object_count + visuals.object_count(live.id)
+      if visuals.is_dirty(live.id) then dirty_field_count = dirty_field_count + 1 end
+    end
+  end
+  for _, live_job in pairs(root.jobs) do
+    local live_field = root.fields[live_job.field_id]
+    if live_field and live_field.surface_index == surface_index then
+      all_jobs[#all_jobs + 1] = {id = live_job.id, field_id = live_job.field_id, state = live_job.state,
+        operation = live_job.operation, machine_id = live_job.machine_id, priority = live_job.priority,
+        request_tick = live_job.request_tick, failure = live_job.failure,
+        completed_area = live_field.completed_area, total_area = live_field.area,
+        cultivated_area = field_module.operation_area(live_field, "cultivation"),
+        sown_area = field_module.operation_area(live_field, "sowing"),
+        harvested_area = field_module.operation_area(live_field, "harvesting"), crop_count = #live_field.crops}
+    end
+  end
+  table.sort(all_jobs, function(a, b) return a.id < b.id end)
   return {
+    tick = game.tick,
+    fleet = {owned = owned_machine_count, active = active_machine_count},
+    controller_due = last_tick_telemetry.controller_due,
+    controller_updated_machine_id = last_tick_telemetry.controller_updated_machine_id,
+    path_queue_depth = last_tick_telemetry.path_queue_depth,
+    outstanding_paths = last_tick_telemetry.outstanding_paths,
+    visual_objects = visual_object_count,
+    dirty_fields = dirty_field_count,
+    jobs = all_jobs,
     field = work_field and {
       id = work_field.id,
       completed_area = work_field.completed_area,

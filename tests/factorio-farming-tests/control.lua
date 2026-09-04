@@ -1,5 +1,7 @@
 local field = require("__factorio-farming__/scripts/field")
 local slice = require("__factorio-farming__/scripts/slice")
+local scale_ledger = require("__factorio-farming__/scripts/scale_ledger")
+local run_scale_ledger_spec = require("scale_ledger_spec")
 local mode = require("mode")
 
 local BENCH_TICKS = 18000
@@ -349,6 +351,13 @@ local function run_pure_tests()
   truthy(slice.transition(paused_job, "working"), "paused to working transition")
 end
 
+-- The ledger itself has no Factorio API dependency. Running the same spec in
+-- the test mod prevents the standalone fast path from becoming a substitute
+-- for the staged production code that a characterization scenario uses.
+local function run_scale_ledger_tests()
+  run_scale_ledger_spec(scale_ledger, {equal = equal, truthy = truthy})
+end
+
 local function build_surface(name)
   local surface = game.create_surface("farming-production-slice-test-" .. name, {
     width = 384,
@@ -387,8 +396,81 @@ local function snapshot(surface_index)
   return remote.call("factorio_farming", "snapshot", surface_index)
 end
 
+-- Scale fields are deliberately isolated: every 64 x 16 field has its own
+-- west-side tractor approach, and neighbouring corridors are separated by at
+-- least 32 tiles. This measures the production scheduler, controller, range
+-- authority, path queue, and projections without claiming to model traffic.
+local SCALE_COLUMNS = 10
+local SCALE_X_STRIDE = 96
+local SCALE_Y_STRIDE = 48
+
+local function scale_field_spec(index)
+  local column = (index - 1) % SCALE_COLUMNS
+  local row = math.floor((index - 1) / SCALE_COLUMNS)
+  local left = column * SCALE_X_STRIDE
+  local top = row * SCALE_Y_STRIDE
+  return {
+    bounds = {left = left, top = top, right = left + 64, bottom = top + 16},
+    tractor = {x = left - 20, y = top + 8}
+  }
+end
+
+local function build_scale_surface(name, count)
+  local rows = math.ceil(count / SCALE_COLUMNS)
+  local surface = game.create_surface("farming-production-scale-" .. name, {
+    width = SCALE_COLUMNS * SCALE_X_STRIDE + 64,
+    height = rows * SCALE_Y_STRIDE + 64,
+    peaceful_mode = true,
+    autoplace_controls = {}
+  })
+  surface.generate_with_lab_tiles = true
+  local tiles = {}
+  local specs = {}
+  for index = 1, count do
+    local spec = scale_field_spec(index)
+    specs[index] = spec
+    surface.request_to_generate_chunks(spec.tractor, 1)
+    for y = spec.bounds.top - 8, spec.bounds.bottom + 8 do
+      for x = spec.tractor.x - 8, spec.bounds.right + 8 do
+        tiles[#tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
+      end
+    end
+  end
+  surface.force_generate_chunk_requests()
+  surface.set_tiles(tiles, true, true, true, false)
+  for _, entity in pairs(surface.find_entities_filtered({
+    area = {{-32, -32}, {SCALE_COLUMNS * SCALE_X_STRIDE + 32, rows * SCALE_Y_STRIDE + 32}},
+    type = {"tree", "simple-entity", "cliff", "resource", "unit", "unit-spawner", "turret"}
+  })) do
+    entity.destroy()
+  end
+  return surface, specs
+end
+
 local function queued_job(snap, id)
   for _, job in ipairs(snap.queued_jobs or {}) do
+    if job.id == id then return job end
+  end
+  return nil
+end
+
+local function scale_snapshot_sample(snap)
+  return {
+    tick = snap.tick,
+    machines_total = snap.fleet and snap.fleet.owned or 0,
+    machines_active = snap.fleet and snap.fleet.active or 0,
+    controller_due = snap.controller_due,
+    controller_updated_machine_id = snap.controller_updated_machine_id,
+    path_queue_depth = snap.path_queue_depth,
+    outstanding_paths = snap.outstanding_paths,
+    visual_objects = snap.visual_objects,
+    dirty_fields = snap.dirty_fields,
+    jobs = snap.jobs
+  }
+end
+
+local function scale_job(snap, id)
+  for _, job in ipairs(snap.jobs or {}) do
     if job.id == id then return job end
   end
   return nil
@@ -609,6 +691,227 @@ local function drive_fleet(event)
   elseif event.tick >= storage.fleet_deadline then
     write_result("fleet", {passed = false, snapshot = snap})
     fail("two-tractor dispatch timeout")
+  end
+end
+
+-- ---------------------------------------------------------------- fleet scale
+--
+-- These scenarios intentionally use the same production setup, queue, path,
+-- controller, field-coverage, and visual seams as the two-tractor acceptance
+-- test. The only test-only policy is the deterministic spacing of otherwise
+-- identical 64 x 16 fields; traffic coordination is not characterized here.
+local SCALE_SIZES = {2, 10, 25, 50, 100}
+
+local function create_scale_fixture(count, label)
+  local surface, specs = build_scale_surface(label, count)
+  local first = specs[1]
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    first.bounds, first.tractor, true)
+  truthy(ok, message or "scale primary tractor setup failed")
+  local initial = snapshot(surface.index)
+  local ids = {initial.job.id}
+  local crop_rectangles = {[initial.job.id] = {
+    left = first.bounds.left, top = first.bounds.top, right = first.bounds.left + 4, bottom = first.bounds.top + 4
+  }}
+  for index = 2, count do
+    local spec = specs[index]
+    ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, spec.tractor)
+    truthy(ok, message or ("scale tractor " .. tostring(index) .. " setup failed"))
+    local queued, queue_error, job_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+      spec.bounds, count - index, "cultivation")
+    truthy(queued, queue_error or ("scale field " .. tostring(index) .. " queue failed"))
+    ids[index] = job_id
+    crop_rectangles[job_id] = {
+      left = spec.bounds.left, top = spec.bounds.top, right = spec.bounds.left + 4, bottom = spec.bounds.top + 4
+    }
+  end
+  return {surface = surface.index, ids = ids, crop_rectangles = crop_rectangles}
+end
+
+local function init_scale(count, capture)
+  local fixture = create_scale_fixture(count, (capture and "capture-" or "") .. tostring(count))
+  storage.scale_run = {
+    count = count,
+    capture = capture,
+    surface = fixture.surface,
+    ids = fixture.ids,
+    crop_rectangles = fixture.crop_rectangles,
+    started = game.tick,
+    deadline = game.tick + count * 18000,
+    ledger = scale_ledger.new({label = "fleet-" .. tostring(count), fleet_size = count,
+      field_count = count, window_ticks = count * 18000})
+  }
+end
+
+local function scale_jobs_complete(snap, run)
+  if #(snap.jobs or {}) ~= run.count then return false end
+  for _, id in ipairs(run.ids) do
+    local job = scale_job(snap, id)
+    if not job or job.state ~= "completed" or job.completed_area ~= job.total_area then return false end
+  end
+  return true
+end
+
+local function scale_crop_projection_complete(snap, run)
+  if #(snap.field_visuals or {}) ~= run.count then return false end
+  for _, id in ipairs(run.ids) do
+    local job = scale_job(snap, id)
+    if not job or job.crop_count < 1 then return false end
+  end
+  for _, field_visual in ipairs(snap.field_visuals or {}) do
+    if field_visual.dirty then return false end
+    local crop_growth = field_visual.projection and field_visual.projection.rectangle_counts and
+      field_visual.projection.rectangle_counts.crop_growth
+    if not crop_growth or (crop_growth.sown + crop_growth.growing + crop_growth.ready) < 1 then return false end
+  end
+  return true
+end
+
+local function write_scale_failure(name, run, snap, reason)
+  local samples = run.profiling and remote.call("factorio_farming", "debug_profile_stop") or 0
+  run.profiling = false
+  write_result(name, {passed = false, reason = reason, count = run.count, samples = samples,
+    ledger = scale_ledger.summarize(run.ledger), snapshot = snap})
+  fail(reason)
+end
+
+local function capture_scale_recovery(run, snap)
+  truthy(snap.pending_path_count > 0,
+    "scale recovery capture requires a real pending path request to invalidate")
+  local captured = {count = run.count, surface = run.surface, ids = run.ids, coverage = {}, generations = {},
+    capture_tick = snap.tick, pending_path_count = snap.pending_path_count,
+    path_queue_depth = snap.path_queue_depth, outstanding_paths = snap.outstanding_paths}
+  for _, id in ipairs(run.ids) do
+    local job = scale_job(snap, id)
+    captured.coverage[id] = job and job.completed_area or -1
+  end
+  for _, machine in ipairs(snap.machines or {}) do captured.generations[machine.id] = machine.generation end
+  storage.scale_recovery = captured
+  game.auto_save("scale-" .. tostring(run.count) .. "-working")
+  write_result("scale-" .. tostring(run.count) .. "-capture", {passed = true, count = run.count,
+    capture_tick = snap.tick, pending_path_count = snap.pending_path_count,
+    path_queue_depth = snap.path_queue_depth, outstanding_paths = snap.outstanding_paths,
+    ledger = scale_ledger.summarize(run.ledger)})
+  script.on_event(defines.events.on_tick, nil)
+end
+
+local function drive_scale(event)
+  local run = storage.scale_run
+  local snap = snapshot(run.surface)
+  scale_ledger.record(run.ledger, scale_snapshot_sample(snap))
+  if not run.profiling and not run.capture and event.tick >= run.started + 10 then
+    truthy(remote.call("factorio_farming", "debug_profile_start"), "scale profiler did not start")
+    run.profiling = true
+    run.profile_start_tick = event.tick
+  end
+  for _, id in ipairs(run.ids) do
+    local job = scale_job(snap, id)
+    if job and job.failure then
+      write_scale_failure("scale-" .. tostring(run.count) .. (run.capture and "-capture" or ""), run, snap,
+        "scale field " .. tostring(id) .. " failed: " .. tostring(job.failure))
+      return
+    end
+  end
+  if run.capture then
+    local report = scale_ledger.summarize(run.ledger)
+    local progressed = false
+    for _, id in ipairs(run.ids) do
+      local job = scale_job(snap, id)
+      if job and job.completed_area > 0 then progressed = true end
+    end
+    -- The save must contain an actual outstanding engine request. Capturing
+    -- only after the queue drained would not prove load-time stale-callback
+    -- invalidation or pending-path cleanup.
+    if report.dispatch.jobs_assigned == run.count and progressed and snap.pending_path_count > 0 then
+      capture_scale_recovery(run, snap)
+      return
+    end
+  elseif scale_jobs_complete(snap, run) then
+    if not run.crop_seeded then
+      local stages = {"sown", "growing", "ready"}
+      for index, id in ipairs(run.ids) do
+        local seeded, seed_error = remote.call("factorio_farming", "debug_seed_crop_stage", run.surface,
+          id, stages[((index - 1) % #stages) + 1], {run.crop_rectangles[id]})
+        truthy(seeded, seed_error or "scale crop record fixture failed")
+      end
+      run.crop_seeded = true
+      run.visual_deadline = event.tick + run.count * 20
+      return
+    end
+    if scale_crop_projection_complete(snap, run) then
+      local samples = run.profiling and remote.call("factorio_farming", "debug_profile_stop") or 0
+      run.profiling = false
+      local report = scale_ledger.summarize(run.ledger)
+      equal(#report.violations, 0, "scale ledger reports no authority violations")
+      equal(report.coverage.exact_jobs, run.count, "every scale field completes exact coverage")
+      equal(report.dispatch.jobs_assigned, run.count, "every scale field receives a tractor")
+      equal(snap.fleet.owned, run.count, "scale run retains every owned tractor")
+      equal(snap.pending_path_count, 0, "scale run leaves no pending path")
+      write_result("scale-" .. tostring(run.count), {passed = true, count = run.count,
+        duration_ticks = event.tick - run.started, profile_start_tick = run.profile_start_tick,
+        profile_end_tick = event.tick, profile_samples = samples, fleet = snap.fleet, ledger = report})
+      script.on_event(defines.events.on_tick, nil)
+      return
+    end
+  end
+  if event.tick >= (run.crop_seeded and run.visual_deadline or run.deadline) then
+    write_scale_failure("scale-" .. tostring(run.count) .. (run.capture and "-capture" or ""), run, snap,
+      "production scale " .. tostring(run.count) .. " tractor scenario timed out")
+  end
+end
+
+local function ensure_scale_replay()
+  if storage.scale_replay then return storage.scale_replay end
+  local saved = storage.scale_recovery
+  truthy(saved and saved.count and saved.surface, "scale replay carries no captured recovery fixture")
+  -- A loaded save never calls `on_init`. Construct the test driver lazily on
+  -- its first replay tick, after the production mod has already invalidated
+  -- stale controller callbacks and rebuilt its runtime projections.
+  storage.scale_replay = {saved = saved, started = game.tick, lazy_initialized = true,
+    deadline = game.tick + saved.count * 18000,
+    ledger = scale_ledger.new({label = "fleet-" .. tostring(saved.count) .. "-replay", fleet_size = saved.count,
+      field_count = saved.count, window_ticks = saved.count * 18000})}
+  return storage.scale_replay
+end
+
+local function drive_scale_replay(event)
+  local replay = ensure_scale_replay()
+  local saved = replay.saved
+  local snap = snapshot(saved.surface)
+  scale_ledger.record(replay.ledger, scale_snapshot_sample(snap))
+  if not replay.recovered then
+    truthy(replay.lazy_initialized, "loaded scale replay did not lazily initialize its driver")
+    truthy(saved.pending_path_count > 0, "scale replay fixture had no pending path to invalidate")
+    for _, id in ipairs(saved.ids) do
+      local job = scale_job(snap, id)
+      truthy(job, "scale replay lost captured job " .. tostring(id))
+      truthy(job.completed_area >= saved.coverage[id], "scale replay rewound authoritative coverage")
+    end
+    for _, machine in ipairs(snap.machines or {}) do
+      local generation = saved.generations[machine.id]
+      truthy(generation == nil or machine.generation > generation,
+        "scale replay trusted a stale controller callback for tractor " .. tostring(machine.id))
+    end
+    replay.recovered = true
+  end
+  if scale_jobs_complete(snap, saved) then
+    local report = scale_ledger.summarize(replay.ledger)
+    equal(#report.violations, 0, "scale replay ledger reports no authority violations")
+    equal(report.coverage.exact_jobs, saved.count, "scale replay completes every exact field")
+    equal(snap.pending_path_count, 0, "scale replay leaves no pending path")
+    write_result("scale-" .. tostring(saved.count) .. "-replay", {passed = true, count = saved.count,
+      ticks_after_load = event.tick - replay.started, saved_tick = saved.capture_tick,
+      captured_pending_path_count = saved.pending_path_count,
+      captured_path_queue_depth = saved.path_queue_depth,
+      captured_outstanding_paths = saved.outstanding_paths,
+      lazy_recovery_initialization = replay.lazy_initialized, pending_path_cleaned = true, ledger = report})
+    script.on_event(defines.events.on_tick, nil)
+    return
+  end
+  if event.tick >= replay.deadline then
+    write_result("scale-" .. tostring(saved.count) .. "-replay", {passed = false, count = saved.count,
+      ledger = scale_ledger.summarize(replay.ledger), snapshot = snap})
+    fail("production scale replay timed out")
   end
 end
 
@@ -2100,6 +2403,17 @@ local initializers = {
   fleet = init_fleet,
   ["fleet-failure"] = init_fleet_failure,
   ["implement-overlays"] = init_implement_overlays,
+  ["scale-2"] = function() init_scale(2, false) end,
+  ["scale-10"] = function() init_scale(10, false) end,
+  ["scale-25"] = function() init_scale(25, false) end,
+  ["scale-50"] = function() init_scale(50, false) end,
+  ["scale-100"] = function() init_scale(100, false) end,
+  ["scale-10-capture"] = function() init_scale(10, true) end,
+  ["scale-50-capture"] = function() init_scale(50, true) end,
+  -- Replay starts from a loaded capture, where Factorio deliberately skips
+  -- `on_init`; `drive_scale_replay` initializes its state on the first tick.
+  ["scale-10-replay"] = function() end,
+  ["scale-50-replay"] = function() end,
   ["queue-capture"] = init_queue_capture,
   ["fleet-capture"] = init_fleet_capture
   , ["player-multifield"] = function() init_player_multifield(false) end
@@ -2116,6 +2430,15 @@ local drivers = {
   fleet = drive_fleet,
   ["fleet-failure"] = drive_fleet_failure,
   ["implement-overlays"] = drive_implement_overlays,
+  ["scale-2"] = drive_scale,
+  ["scale-10"] = drive_scale,
+  ["scale-25"] = drive_scale,
+  ["scale-50"] = drive_scale,
+  ["scale-100"] = drive_scale,
+  ["scale-10-capture"] = drive_scale,
+  ["scale-50-capture"] = drive_scale,
+  ["scale-10-replay"] = drive_scale_replay,
+  ["scale-50-replay"] = drive_scale_replay,
   ["queue-capture"] = drive_queue_capture,
   ["queue-replay"] = drive_queue_verify,
   ["fleet-capture"] = drive_fleet_capture,
@@ -2127,6 +2450,7 @@ local drivers = {
 
 script.on_init(function()
   run_pure_tests()
+  run_scale_ledger_tests()
   run_storage_prototype_tests()
   run_storage_placement_tests()
   run_contextual_action_tests()

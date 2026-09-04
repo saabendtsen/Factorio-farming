@@ -14,7 +14,9 @@
 [CmdletBinding()]
 param(
   [string]$FactorioExe = "D:\SteamLibrary\steamapps\common\Factorio\bin\x64\factorio.exe",
-  [switch]$SkipBenchmark
+  [switch]$SkipBenchmark,
+  [switch]$RunFleetScale,
+  [switch]$IncludeScale100
 )
 
 $ErrorActionPreference = "Stop"
@@ -499,6 +501,119 @@ if ($SkipBenchmark) {
       } | ConvertTo-Json | Out-File -FilePath (Join-Path $OutputRoot "performance.json") -Encoding ascii
     }
   }
+}
+
+# ----------------------------------------------------- fleet scale evidence
+
+function Get-FarmingProfileStatistics($logPath) {
+  $samples = New-Object System.Collections.Generic.List[double]
+  if (Test-Path $logPath) {
+    foreach ($line in [System.IO.File]::ReadLines($logPath)) {
+      if ($line -match 'FARMING_PROFILE (\d+) (\d+) Duration: ([0-9.]+)ms') {
+        $samples.Add([double]$Matches[3])
+      }
+    }
+  }
+  if ($samples.Count -eq 0) { return $null }
+  $sorted = $samples | Sort-Object
+  return [pscustomobject]@{
+    samples = $samples.Count
+    average_ms = [Math]::Round(($samples | Measure-Object -Average).Average, 6)
+    p95_ms = [Math]::Round((Get-Percentile $sorted 0.95), 6)
+    max_ms = [Math]::Round($sorted[$sorted.Count - 1], 6)
+  }
+}
+
+function Invoke-FleetScaleBenchmark([int]$count) {
+  $stage = "scale-$count"
+  Set-TestMode $stage
+  # The controller applies one due tractor update per tick. The allowance is a
+  # deterministic timeout, not a target performance budget; a miss is written
+  # to the ledger as evidence rather than relaxed here.
+  $ticks = ($count * 18000) + 1000
+  $save = Join-Path $RunRoot "$stage.zip"
+  Invoke-Factorio "$stage-create" @("--create", $save) | Out-Null
+  if (-not (Test-Path $save)) {
+    Write-Fail "$stage map creation"
+    return $null
+  }
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Invoke-Factorio $stage @("--benchmark", $save, "--benchmark-ticks", "$ticks", "--benchmark-runs", "1") | Out-Null
+  $timer.Stop()
+  $result = Get-Result $stage
+  $profile = Get-FarmingProfileStatistics (Join-Path $LogRoot "$stage.log")
+  if (-not $result -or -not $result.passed -or -not $profile) {
+    Write-Fail "$stage production characterization"
+    Show-ScriptError $stage
+    return $null
+  }
+  $durationSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 3)
+  $effectiveUps = if ($timer.Elapsed.TotalSeconds -gt 0) {
+    [Math]::Round($ticks / $timer.Elapsed.TotalSeconds, 3)
+  } else { 0 }
+  $report = [pscustomobject]@{
+    count = $count
+    completion = $result
+    script_update = $profile
+    benchmark_ticks = $ticks
+    test_duration_seconds = $durationSeconds
+    effective_ups = $effectiveUps
+  }
+  Write-Pass ("scale {0}: exact {0}/{0} fields, avg {1:N4} ms p95 {2:N4} ms max {3:N4} ms, {4:N1} effective UPS" -f `
+    $count, $profile.average_ms, $profile.p95_ms, $profile.max_ms, $effectiveUps)
+  return $report
+}
+
+function Invoke-FleetScaleRecovery([int]$count) {
+  $captureStage = "scale-$count-capture"
+  $capture = Invoke-RealtimeCapture $captureStage 8
+  $captureResult = $capture.Result
+  $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*scale-$count-working.zip" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $capture.SaveCreated -or -not $captureResult -or -not $captureResult.passed -or -not $save) {
+    Write-Fail "scale $count save/load capture"
+    Show-ScriptError $captureStage
+    return $null
+  }
+  $saveBytes = $save.Length
+  $replayStage = "scale-$count-replay"
+  Set-TestMode $replayStage
+  $ticks = ($count * 18000) + 1000
+  Invoke-Factorio $replayStage @("--benchmark", $save.FullName, "--benchmark-ticks", "$ticks", "--benchmark-runs", "1") | Out-Null
+  $replay = Get-Result $replayStage
+  if (-not $replay -or -not $replay.passed -or -not $replay.lazy_recovery_initialization -or
+      -not $replay.pending_path_cleaned) {
+    Write-Fail "scale $count save/load replay"
+    Show-ScriptError $replayStage
+    return $null
+  }
+  Write-Pass "scale $count save/load: stale controllers invalidated, exact coverage resumed, pending paths drained"
+  return [pscustomobject]@{count = $count; save_bytes = $saveBytes; capture = $captureResult; replay = $replay}
+}
+
+if ($RunFleetScale -and $script:Failures.Count -eq 0) {
+  Write-Stage "Fleet scale characterization (serialized)"
+  $scaleResults = @()
+  $scaleCounts = @(2, 10, 25, 50)
+  foreach ($count in $scaleCounts) {
+    $report = Invoke-FleetScaleBenchmark $count
+    if ($report) { $scaleResults += $report }
+  }
+  $scaleRecovery = @()
+  foreach ($count in @(10, 50)) {
+    $recovery = Invoke-FleetScaleRecovery $count
+    if ($recovery) { $scaleRecovery += $recovery }
+  }
+  if ($IncludeScale100 -and $script:Failures.Count -eq 0 -and $scaleResults.Count -eq 4 -and $scaleRecovery.Count -eq 2) {
+    $stretch = Invoke-FleetScaleBenchmark 100
+    if ($stretch) { $scaleResults += $stretch }
+  } elseif ($IncludeScale100) {
+    Write-Host "  scale 100 skipped: the required 2/10/25/50 cases were not all correct and operational"
+  }
+  [pscustomobject]@{scales = $scaleResults; recovery = $scaleRecovery} |
+    ConvertTo-Json -Depth 16 | Out-File -FilePath (Join-Path $OutputRoot "fleet-scale-ledger.json") -Encoding ascii
+} elseif ($RunFleetScale) {
+  Write-Host "  fleet scale characterization skipped because an existing production gate failed"
 }
 
 # ------------------------------------------------------------------ summary

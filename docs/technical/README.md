@@ -10,4 +10,6 @@ The [first production vertical slice](first-production-vertical-slice.md) fixes 
 
 The [whole-field cultivation extension](whole-field-cultivation.md) records the next accepted production increment: four exact lanes, generated physical headland turns, full persistent coverage, and updated save/load and performance evidence.
 
+The [production fleet scale characterization](fleet-scale-characterization.md) defines the deterministic multi-field evidence ledger for 2, 10, 25, and 50 concurrently active tractors, with a gated 100-tractor stretch case.
+
 See the repository [task tracker](../../TASKS.md) for current scope and status.
