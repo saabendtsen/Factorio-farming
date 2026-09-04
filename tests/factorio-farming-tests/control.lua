@@ -394,6 +394,13 @@ local function queued_job(snap, id)
   return nil
 end
 
+local function overlay_machine_entry(snap, machine_id)
+  for _, machine in ipairs(snap.machines or {}) do
+    if machine.id == machine_id then return machine end
+  end
+  return nil
+end
+
 local function fragmented_crop_rectangles(left)
   local rectangles = {}
   for offset = 0, 36, 4 do
@@ -602,6 +609,163 @@ local function drive_fleet(event)
   elseif event.tick >= storage.fleet_deadline then
     write_result("fleet", {passed = false, snapshot = snap})
     fail("two-tractor dispatch timeout")
+  end
+end
+
+-- Three generic tractors retain the same logical capabilities while their
+-- assigned cultivation, sowing, and harvesting projections remain visibly
+-- distinct, attached, disposable, and independent.
+local OVERLAY_JOB_SPECS = {
+  {bounds = {left = 160, top = 0, right = 224, bottom = 16}, priority = 30, operation = "cultivation"},
+  {bounds = {left = 240, top = 0, right = 304, bottom = 16}, priority = 20, operation = "sowing"},
+  {bounds = {left = 80, top = 32, right = 144, bottom = 48}, priority = 10, operation = "harvesting"}
+}
+
+local function init_implement_overlays()
+  local surface = build_surface("implement-overlays")
+  local ok, message = remote.call("factorio_farming", "debug_setup", surface.index,
+    FIELD_BOUNDS, TRACTOR_POSITION, false)
+  truthy(ok, message or "implement overlay primary tractor setup failed")
+  local initial = snapshot(surface.index)
+  equal(initial.machines[1].implement_overlay, nil, "idle generic tractor projects an implement overlay")
+  for _, position in ipairs({{x = -20, y = 16}, {x = -20, y = 24}}) do
+    ok, message = remote.call("factorio_farming", "debug_add_tractor", surface.index, position)
+    truthy(ok, message or "implement overlay fleet tractor setup failed")
+  end
+  local ids = {}
+  for index, spec in ipairs(OVERLAY_JOB_SPECS) do
+    local queued, queue_error, job_id = remote.call("factorio_farming", "debug_queue_field", surface.index,
+      spec.bounds, spec.priority, spec.operation)
+    truthy(queued, queue_error or (spec.operation .. " overlay field job queue failed"))
+    ids[index] = job_id
+  end
+  storage.implement_overlays = {surface = surface.index, job_ids = ids, deadline = game.tick + 3000}
+end
+
+local function assert_distinct_implement_overlays(snap, run)
+  local sprites = {}
+  for index, spec in ipairs(OVERLAY_JOB_SPECS) do
+    local job = queued_job(snap, run.job_ids[index])
+    truthy(job and job.machine_id, spec.operation .. " field job has no tractor assignment")
+    local machine = overlay_machine_entry(snap, job.machine_id)
+    local overlay = machine and machine.implement_overlay
+    truthy(overlay, spec.operation .. " tractor has no implement overlay")
+    equal(overlay.operation, spec.operation, spec.operation .. " tractor projects the wrong logical implement")
+    equal(overlay.object_count, 2, spec.operation .. " overlay does not contain its width bar and badge")
+    equal(overlay.work_width, 4, spec.operation .. " overlay does not communicate four-tile work width")
+    equal(overlay.target_unit_number, machine.unit_number, spec.operation .. " overlay is not attached to its tractor")
+    truthy(not sprites[overlay.badge_sprite], "two logical implements share the same overlay badge")
+    sprites[overlay.badge_sprite] = true
+  end
+end
+
+local function assert_render_objects_disposed(object_ids, label)
+  for _, object_id in ipairs(object_ids or {}) do
+    equal(rendering.get_object_by_id(object_id), nil,
+      label .. " leaked render object " .. tostring(object_id))
+  end
+end
+
+local function capture_overlay_object_ids(snap, job_ids)
+  local captured = {}
+  for _, job_id in ipairs(job_ids or {}) do
+    local job = queued_job(snap, job_id)
+    local machine = job and job.machine_id and overlay_machine_entry(snap, job.machine_id)
+    local overlay = machine and machine.implement_overlay
+    truthy(overlay and overlay.object_ids, "implement overlay has no render object identities")
+    captured[job_id] = overlay.object_ids
+  end
+  return captured
+end
+
+local function record_active_overlay_object_ids(snap, seen)
+  for _, machine in ipairs(snap.machines or {}) do
+    local overlay = machine.implement_overlay
+    for _, object_id in ipairs(overlay and overlay.object_ids or {}) do seen[object_id] = true end
+  end
+end
+
+local function drive_implement_overlays(event)
+  local run = storage.implement_overlays
+  local snap = snapshot(run.surface)
+  if not run.initial_projection_seen then
+    local ready = true
+    for _, job_id in ipairs(run.job_ids) do
+      local job = queued_job(snap, job_id)
+      local machine = job and job.machine_id and overlay_machine_entry(snap, job.machine_id)
+      if not machine or not machine.implement_overlay then ready = false end
+    end
+    if not ready then return end
+    assert_distinct_implement_overlays(snap, run)
+    run.initial_overlay_object_ids = capture_overlay_object_ids(snap, run.job_ids)
+    run.initial_projection_seen = true
+    truthy(remote.call("factorio_farming", "debug_reset_tractor_implement_overlays", run.surface),
+      "implement overlays could not be reset through the configuration rebuild path")
+    return
+  end
+
+  if not run.rebuilt_projection_seen then
+    assert_distinct_implement_overlays(snap, run)
+    local rebuilt = capture_overlay_object_ids(snap, run.job_ids)
+    for job_id, initial_ids in pairs(run.initial_overlay_object_ids) do
+      local rebuilt_ids = rebuilt[job_id]
+      truthy(rebuilt_ids and rebuilt_ids[1] ~= initial_ids[1] and rebuilt_ids[2] ~= initial_ids[2],
+        "configuration rebuild reused stale implement overlay render objects")
+      assert_render_objects_disposed(initial_ids, "configuration rebuild")
+    end
+    run.rebuilt_projection_seen = true
+    game.take_screenshot({surface = game.get_surface(run.surface), position = {x = -20, y = 16},
+      resolution = {x = 1280, y = 720}, zoom = 1,
+      path = "factorio-farming-tests/implement-overlays.png", show_gui = false})
+    return
+  end
+
+  if not run.destroyed_machine_id then
+    local first = queued_job(snap, run.job_ids[1])
+    run.destroyed_machine_id = first.machine_id
+    local machine = overlay_machine_entry(snap, run.destroyed_machine_id)
+    run.destroyed_overlay_object_ids = machine.implement_overlay.object_ids
+    truthy(remote.call("factorio_farming", "debug_destroy_tractor", run.surface),
+      "overlay tractor destruction failed")
+    return
+  end
+
+  local first = queued_job(snap, run.job_ids[1])
+  if first.state == "failed" then
+    local destroyed = overlay_machine_entry(snap, run.destroyed_machine_id)
+    truthy(destroyed and not destroyed.valid, "destroyed overlay tractor remains valid")
+    equal(destroyed.implement_overlay, nil, "failed destroyed tractor retained an implement overlay")
+    assert_render_objects_disposed(run.destroyed_overlay_object_ids, "destroyed tractor")
+    if not run.replacement_requested then
+      truthy(remote.call("factorio_farming", "debug_replace_tractor", run.surface, {x = -20, y = 16}),
+        "overlay replacement tractor creation failed")
+      truthy(remote.call("factorio_farming", "debug_resume", run.surface),
+        "overlay replacement tractor resume failed")
+      run.replacement_requested = true
+      return
+    end
+  end
+  if run.replacement_requested then
+    local replacement = overlay_machine_entry(snap, first.machine_id)
+    local replacement_overlay = replacement and replacement.implement_overlay
+    truthy(replacement_overlay, "resumed replacement tractor has no implement overlay")
+    equal(replacement_overlay.operation, "cultivation", "resumed replacement projects the wrong implement")
+    truthy(replacement_overlay.object_ids[1] ~= run.destroyed_overlay_object_ids[1] and
+      replacement_overlay.object_ids[2] ~= run.destroyed_overlay_object_ids[2],
+      "resumed replacement reused destroyed implement overlay render objects")
+    for index = 2, 3 do
+      local survivor_job = queued_job(snap, run.job_ids[index])
+      local survivor = overlay_machine_entry(snap, survivor_job.machine_id)
+      equal(survivor.implement_overlay.operation, OVERLAY_JOB_SPECS[index].operation,
+        "peer tractor overlay changed after another tractor was destroyed")
+    end
+    write_result("implement-overlays", {passed = true, operations = {
+      OVERLAY_JOB_SPECS[1].operation, OVERLAY_JOB_SPECS[2].operation, OVERLAY_JOB_SPECS[3].operation},
+      screenshot = "factorio-farming-tests/implement-overlays.png"})
+    script.on_event(defines.events.on_tick, nil)
+  elseif event.tick >= run.deadline then
+    write_result("implement-overlays", {passed = false, snapshot = snap})
+    fail("implement overlay lifecycle timeout")
   end
 end
 
@@ -815,9 +979,17 @@ local function drive_fleet_capture(event)
     equal(#(snap.machines or {}), 2, "fleet save capture snapshot lost a tractor")
 
     local generations = {}
+    local overlay_object_ids = {}
     for _, machine in ipairs(snap.machines) do
       truthy(machine.generation, "fleet save capture snapshot exposes no controller generation")
       generations[machine.id] = machine.generation
+      local overlay = machine.implement_overlay
+      truthy(overlay, "fleet save capture tractor has no active implement overlay")
+      equal(overlay.operation, "cultivation", "fleet save capture tractor projects the wrong implement")
+      equal(overlay.object_count, 2, "fleet save capture overlay is incomplete")
+      equal(overlay.target_unit_number, machine.unit_number, "fleet save capture overlay targets the wrong tractor")
+      equal(#(overlay.object_ids or {}), 2, "fleet save capture exposes no projection identities")
+      overlay_object_ids[machine.id] = overlay.object_ids
     end
 
     storage.fleet_saved = {
@@ -833,7 +1005,8 @@ local function drive_fleet_capture(event)
       first_area = first.completed_area,
       second_area = second.completed_area,
       waiting_area = waiting.completed_area,
-      generations = generations
+      generations = generations,
+      overlay_object_ids = overlay_object_ids
     }
     game.auto_save("fleet-working")
     write_result("fleet-capture", {passed = true, saved = {"fleet-working"}, tick = event.tick,
@@ -856,6 +1029,8 @@ local function drive_fleet_verify(event)
   local waiting = queued_job(snap, saved.waiting_id)
   truthy(first and second and waiting, "fleet save/load lost a queued job")
   check_fleet_invariants(snap, {first, second, waiting}, fleet_verify.areas, "fleet replay")
+  fleet_verify.observed_overlay_object_ids = fleet_verify.observed_overlay_object_ids or {}
+  record_active_overlay_object_ids(snap, fleet_verify.observed_overlay_object_ids)
 
   if not fleet_verify.started then
     fleet_verify.started = event.tick
@@ -884,6 +1059,16 @@ local function drive_fleet_verify(event)
       truthy(entry.generation and saved.generations[machine_id] and
         entry.generation > saved.generations[machine_id],
         "fleet load did not invalidate the saved controller for tractor " .. tostring(machine_id))
+      local overlay = entry.implement_overlay
+      truthy(overlay, "fleet load did not rebuild the active tractor implement overlay")
+      equal(overlay.operation, "cultivation", "fleet load rebuilt the wrong logical implement overlay")
+      equal(overlay.object_count, 2, "fleet load rebuilt an incomplete implement overlay")
+      equal(overlay.target_unit_number, entry.unit_number, "fleet load rebuilt the overlay on the wrong tractor")
+      local saved_ids = saved.overlay_object_ids[machine_id]
+      truthy(saved_ids and overlay.object_ids and overlay.object_ids[1] ~= saved_ids[1] and
+        overlay.object_ids[2] ~= saved_ids[2],
+        "fleet load trusted saved render objects instead of reconstructing the overlay")
+      assert_render_objects_disposed(saved_ids, "fleet load reconstruction")
     end
     return
   end
@@ -920,6 +1105,10 @@ local function drive_fleet_verify(event)
   truthy(fleet_verify.waiting_machine_id, "waiting fleet field never received a tractor after load")
   for _, machine in ipairs(snap.machines or {}) do
     equal(machine.job_id, nil, "fleet tractor retained a claim after every field completed")
+    equal(machine.implement_overlay, nil, "completed fleet tractor retained an implement overlay")
+  end
+  for object_id in pairs(fleet_verify.observed_overlay_object_ids) do
+    assert_render_objects_disposed({object_id}, "completed fleet tractor")
   end
   equal(snap.pending_path_count, 0, "fleet replay left a pending path")
   write_result("saveload-fleet-working", {
@@ -1673,6 +1862,7 @@ local initializers = {
   queue = init_queue,
   fleet = init_fleet,
   ["fleet-failure"] = init_fleet_failure,
+  ["implement-overlays"] = init_implement_overlays,
   ["queue-capture"] = init_queue_capture,
   ["fleet-capture"] = init_fleet_capture
 }
@@ -1686,6 +1876,7 @@ local drivers = {
   queue = drive_queue,
   fleet = drive_fleet,
   ["fleet-failure"] = drive_fleet_failure,
+  ["implement-overlays"] = drive_implement_overlays,
   ["queue-capture"] = drive_queue_capture,
   ["queue-replay"] = drive_queue_verify,
   ["fleet-capture"] = drive_fleet_capture,

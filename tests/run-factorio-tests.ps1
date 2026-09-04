@@ -215,6 +215,48 @@ else {
   }
 }
 
+Write-Stage "Disposable tractor implement overlay lifecycle"
+Set-TestMode "implement-overlays"
+$overlaySave = Join-Path $RunRoot "implement-overlays-test.zip"
+Invoke-Factorio "implement-overlays-create" @("--create", $overlaySave) | Out-Null
+if (-not (Test-Path $overlaySave)) { Write-Fail "implement overlay map creation" }
+else {
+  Invoke-Factorio "implement-overlays" @("--benchmark", $overlaySave, "--benchmark-ticks", "3000", "--benchmark-runs", "1") | Out-Null
+  $overlays = Get-Result "implement-overlays"
+  $overlayScreenshot = Join-Path $OutputRoot "implement-overlays.png"
+  if ($overlays -and $overlays.passed) {
+    Write-Pass "cultivation, sowing, and harvesting overlays are distinct, attached, rebuilt, and disposed"
+  } else {
+    Write-Fail "implement overlay lifecycle"
+    Show-ScriptError "implement-overlays"
+  }
+
+  if ($overlays -and $overlays.passed) {
+    if (Test-Path $overlayScreenshot) { Remove-Item -LiteralPath $overlayScreenshot -Force }
+    $previousSteamAppId = $env:SteamAppId
+    $env:SteamAppId = "427520"
+    $graphicsArguments = @("--config", $ConfigIni, "--mod-directory", $ModRoot, "--disable-audio",
+      "--window-size", "1280x720", "--benchmark-graphics", $overlaySave, "--benchmark-ticks", "3000")
+    $graphics = Start-Process -FilePath $FactorioExe -ArgumentList $graphicsArguments -PassThru
+    if ($null -eq $previousSteamAppId) { Remove-Item Env:SteamAppId }
+    else { $env:SteamAppId = $previousSteamAppId }
+    $graphicsDeadline = (Get-Date).AddSeconds(90)
+    while (-not (Test-Path $overlayScreenshot) -and -not $graphics.HasExited -and
+           (Get-Date) -lt $graphicsDeadline) {
+      Start-Sleep -Milliseconds 500
+    }
+    if (Test-Path $overlayScreenshot) {
+      Start-Sleep -Milliseconds 500
+      Write-Pass "headed ordinary-zoom overlay screenshot: $overlayScreenshot"
+    } else {
+      Write-Fail "headed implement overlay screenshot"
+      Show-ScriptError "implement-overlays-headed"
+    }
+    if (-not $graphics.HasExited) { Stop-Process -Id $graphics.Id -Force }
+    Start-Sleep -Seconds 1
+  }
+}
+
 Write-Stage "Shared queue save/load capture"
 $capturedQueuePhases = @()
 $queueCaptureOutcome = Invoke-RealtimeCapture "queue-capture" 4
@@ -315,7 +357,7 @@ $specialReplays = @(
   },
   [pscustomobject]@{
     Phase = "fleet-working"; Captured = $capturedFleetPhases; Mode = "fleet-replay"; Ticks = "90000"
-    Label = "fleet"; Pass = "two working fields and one waiting field completed exactly"
+    Label = "fleet"; Pass = "active overlays rebuilt, all fields completed exactly, and overlays disposed"
   }
 )
 

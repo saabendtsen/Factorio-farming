@@ -166,6 +166,7 @@ local function fail_job(state, reason, player)
     machine.job_id = nil
     machine.generation = machine.generation + 1
     movement.invalidate(machine)
+    visuals.sync_machine(machine, nil, movement.entity(machine))
   end
   notify(player, reason)
 end
@@ -187,6 +188,7 @@ local function reserve_job(state)
   job.lane_claim = state.field.lane_index
   machine.job_id = job.id
   slice.transition(job, "reserved")
+  visuals.sync_machine(machine, job, movement.entity(machine))
   return true
 end
 
@@ -345,7 +347,7 @@ function slice.on_configuration_changed()
   local root = ensure_root()
   -- Projections are disposable: a configuration change discards every one of
   -- them and re-marks each live field by its durable identity.
-  visuals.reset(root.fields)
+  visuals.reset(root.fields, root.machines, root.jobs)
   for _, player in pairs(game.players) do enable_setup_shortcut(player) end
 end
 
@@ -488,7 +490,7 @@ local function recover_loaded_state()
     end
   end
   -- A load never trusts saved projections; it rebuilds them from field records.
-  visuals.reset(root.fields)
+  visuals.reset(root.fields, root.machines, root.jobs)
 end
 
 function slice.show_setup_hint(player)
@@ -617,6 +619,7 @@ end
 local function resume_state(state, player)
   local job = state.job
   local machine = state.machine
+  local machine_entity = machine and movement.entity(machine)
   if state.field and state.field.migration_failed then
     notify(player, "This field migration failed and cannot be resumed.")
     return false
@@ -625,7 +628,7 @@ local function resume_state(state, player)
     notify(player, job and "The farming job is already active." or "There is no farming job to resume.")
     return false
   end
-  if not machine or not movement.entity(machine) then
+  if not machine_entity then
     notify(player, "Create a replacement tractor with /farming-slice-setup first.")
     return false
   end
@@ -662,6 +665,7 @@ local function resume_state(state, player)
   else
     begin_travel(state)
   end
+  visuals.sync_machine(machine, job, machine_entity)
   job.paused_from = nil
   job.restart_from_work = nil
   job.paused_motion = nil
@@ -809,6 +813,7 @@ complete_job = function(state)
   job.lane_claim = nil
   machine.job_id = nil
   machine.controller.state = "idle"
+  visuals.sync_machine(machine, nil, movement.entity(machine))
   game.print({"", "[Factorio Farming] ", job.operation, " complete. Select the field to start its next operation."})
   local player = job.player_index and game.get_player(job.player_index)
   if player then slice.show_contextual_action(player) end
@@ -1153,7 +1158,8 @@ function slice.snapshot(surface_index)
         y = movement.entity(machine).position.y
       } or nil,
       speed = movement.entity(machine) and movement.entity(machine).speed or nil,
-      orientation = movement.entity(machine) and movement.entity(machine).orientation or nil
+      orientation = movement.entity(machine) and movement.entity(machine).orientation or nil,
+      implement_overlay = visuals.machine_overlay(machine.id)
     } or nil,
     machines = (function()
       local result = {}
@@ -1168,7 +1174,8 @@ function slice.snapshot(surface_index)
             controller_goal = fleet_machine.controller and fleet_machine.controller.goal and
               copy_position(fleet_machine.controller.goal) or nil,
             controller_work_position = fleet_machine.controller and fleet_machine.controller.work_position and
-              copy_position(fleet_machine.controller.work_position) or nil}
+              copy_position(fleet_machine.controller.work_position) or nil,
+            implement_overlay = visuals.machine_overlay(fleet_machine.id)}
         end
       end
       table.sort(result, function(a, b) return a.id < b.id end)
@@ -1218,6 +1225,12 @@ function slice.debug_add_tractor(surface_index, position)
   local surface = game.get_surface(surface_index)
   local machine, error_message = create_machine(surface, game.forces.player, position, true)
   return machine ~= nil, error_message, machine and machine.id
+end
+
+function slice.debug_reset_tractor_implement_overlays(surface_index)
+  local root = ensure_root()
+  visuals.reset_machine_overlays(root.machines, root.jobs, surface_index)
+  return true
 end
 
 -- `field_id` addresses any live field on the surface by durable identity;
