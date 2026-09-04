@@ -145,7 +145,7 @@ function ledger.summarize(state)
   end
   minimum = minimum or 0
   local samples = state.samples
-  local saturation = state.controller_due_total == 0 and 1000 or
+  local saturation = samples == 0 and 0 or state.controller_due_total == 0 and 1000 or
     math.floor(state.controller_updates * 1000 / state.controller_due_total)
   local dispatch_rows = {}
   for job_id, assignment in pairs(state.dispatch_assignments) do

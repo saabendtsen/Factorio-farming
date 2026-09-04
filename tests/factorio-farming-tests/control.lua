@@ -403,12 +403,15 @@ end
 local SCALE_COLUMNS = 10
 local SCALE_X_STRIDE = 96
 local SCALE_Y_STRIDE = 48
+-- Finite Factorio surfaces are centred on zero.  Keep all ten corridors
+-- inside the generated rectangle instead of treating its left boundary as x=0.
+local SCALE_LEFT = -(SCALE_COLUMNS * SCALE_X_STRIDE) / 2
 
-local function scale_field_spec(index)
+local function scale_field_spec(index, rows)
   local column = (index - 1) % SCALE_COLUMNS
   local row = math.floor((index - 1) / SCALE_COLUMNS)
-  local left = column * SCALE_X_STRIDE
-  local top = row * SCALE_Y_STRIDE
+  local left = SCALE_LEFT + column * SCALE_X_STRIDE
+  local top = -(rows * SCALE_Y_STRIDE) / 2 + row * SCALE_Y_STRIDE
   return {
     bounds = {left = left, top = top, right = left + 64, bottom = top + 16},
     tractor = {x = left - 20, y = top + 8}
@@ -424,20 +427,24 @@ local function build_scale_surface(name, count)
     autoplace_controls = {}
   })
   surface.generate_with_lab_tiles = true
-  local tiles = {}
   local specs = {}
   for index = 1, count do
-    local spec = scale_field_spec(index)
+    local spec = scale_field_spec(index, rows)
     specs[index] = spec
+    -- Radius-one requests contain nine chunks.  A one-shot request for a
+    -- 50-tractor fixture crosses Factorio's queued-generation boundary, so
+    -- later corridors can look traversable while their entrance chunk is not
+    -- generated yet.  Prepare each isolated corridor synchronously instead.
     surface.request_to_generate_chunks(spec.tractor, 1)
+    surface.force_generate_chunk_requests()
+    local tiles = {}
     for y = spec.bounds.top - 8, spec.bounds.bottom + 8 do
       for x = spec.tractor.x - 8, spec.bounds.right + 8 do
         tiles[#tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
       end
     end
+    surface.set_tiles(tiles, true, true, true, false)
   end
-  surface.force_generate_chunk_requests()
-  surface.set_tiles(tiles, true, true, true, false)
   for _, entity in pairs(surface.find_entities_filtered({
     area = {{-32, -32}, {SCALE_COLUMNS * SCALE_X_STRIDE + 32, rows * SCALE_Y_STRIDE + 32}},
     type = {"tree", "simple-entity", "cliff", "resource", "unit", "unit-spawner", "turret"}
