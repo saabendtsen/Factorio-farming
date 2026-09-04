@@ -63,6 +63,7 @@ local function ensure_root()
   root.visual_dirty = root.visual_dirty or {}
   root.visuals = root.visuals or {}
   root.destroy_registrations = root.destroy_registrations or {}
+  root.player_selected_field_ids = root.player_selected_field_ids or {}
   return root
 end
 
@@ -79,6 +80,43 @@ local function surface_state(surface_index)
   local root = ensure_root()
   root.surfaces[surface_index] = root.surfaces[surface_index] or {}
   return root.surfaces[surface_index]
+end
+
+local function job_for_field(root, field_id)
+  for _, job in pairs(root.jobs) do
+    if job.field_id == field_id then return job end
+  end
+  return nil
+end
+
+-- Player selection is a durable presentation preference.  It deliberately
+-- does not replace the surface aliases used by dispatch and recovery, because
+-- another tractor may be working a different field at the same time.
+local function selected_field_id(root, player_index, surface_index)
+  local by_surface = player_index and root.player_selected_field_ids[player_index]
+  return by_surface and by_surface[surface_index] or nil
+end
+
+local function presented_state(surface_index, player_index)
+  local root = ensure_root()
+  local state = surface_state(surface_index)
+  local selected_id = selected_field_id(root, player_index, surface_index)
+  local work_field = selected_id and root.fields[selected_id] or state.field
+  if not work_field or work_field.surface_index ~= surface_index then
+    work_field = state.field
+  end
+  local job = work_field and job_for_field(root, work_field.id) or state.job
+  local machine = job and job.machine_id and root.machines[job.machine_id] or state.machine
+  return {root = root, surface = state, field = work_field, job = job, machine = machine}
+end
+
+local function present_field_id(root, player_index, work_field)
+  root.player_selected_field_ids[player_index] = root.player_selected_field_ids[player_index] or {}
+  root.player_selected_field_ids[player_index][work_field.surface_index] = work_field.id
+end
+
+local function present_field(player, work_field)
+  present_field_id(ensure_root(), player.index, work_field)
 end
 
 local function notify(player, message)
@@ -251,9 +289,29 @@ local function queued_candidates(root, surface_index)
   return candidates
 end
 
+local function compatible_machine(root, surface_index, operation_name, require_idle)
+  local state = surface_state(surface_index)
+  local ids = {}
+  for _, machine_id in ipairs(state.machine_ids or {}) do ids[#ids + 1] = machine_id end
+  table.sort(ids)
+  for _, machine_id in ipairs(ids) do
+    local machine = root.machines[machine_id]
+    if machine and movement.entity(machine) and (not require_idle or machine.job_id == nil) and
+       operation_implement(machine, operation_name) then
+      return machine
+    end
+  end
+  return nil
+end
+
 local function bounds_intersect(first, second)
   return first.left < second.right and second.left < first.right and
     first.top < second.bottom and second.top < first.bottom
+end
+
+local function same_bounds(first, second)
+  return first.left == second.left and first.right == second.right and
+    first.top == second.top and first.bottom == second.bottom
 end
 
 local function finite_number(value, fallback)
@@ -564,17 +622,48 @@ function slice.on_setup_input(event)
   if player then slice.setup(player) end
 end
 
+local function plan_field_selection(surface_index, player_index, player_position, bounds, player)
+  local root = ensure_root()
+  for _, existing in pairs(root.fields) do
+    if existing.surface_index == surface_index and existing.bounds and same_bounds(existing.bounds, bounds) then
+      present_field_id(root, player_index, existing)
+      if player then clear_setup_hint(player) end
+      notify(player, "Field #" .. existing.id .. " selected.")
+      if player then slice.show_contextual_action(player) end
+      return true, nil, existing.id
+    end
+  end
+
+  local state = surface_state(surface_index)
+  local work_field, job, create_error
+  if not state.field then
+    work_field, create_error = create_field_job(surface_index, bounds, player_position)
+    job = state.job
+  else
+    job, create_error = create_queued_field_job(surface_index, bounds, player_position, "cultivation", 0)
+    work_field = job and root.fields[job.field_id]
+  end
+  if not work_field then notify(player, create_error); return false, create_error end
+  job.player_index = player_index
+  present_field_id(root, player_index, work_field)
+  if player then clear_setup_hint(player) end
+  if job.state == "waiting" then
+    dispatch_queued_jobs(root)
+    notify(player, "Field #" .. work_field.id .. " accepted and cultivation queued.")
+  else
+    notify(player, "Field accepted. Use the contextual field action to start cultivation.")
+  end
+  if player then slice.show_contextual_action(player) end
+  return true, nil, work_field.id
+end
+
 function slice.on_selected_area(event)
   if event.item ~= "farming-field-planner" then return end
   local player = game.get_player(event.player_index)
+  if not player then return end
   local bounds, error_message = field_module.normalize_selection(event.area)
   if not bounds then notify(player, error_message); return end
-  local work_field, create_error = create_field_job(event.surface.index, bounds, player.position)
-  if not work_field then notify(player, create_error); return end
-  surface_state(event.surface.index).job.player_index = event.player_index
-  clear_setup_hint(player)
-  notify(player, "Field accepted. Use the contextual field action to start cultivation.")
-  slice.show_contextual_action(player)
+  plan_field_selection(event.surface.index, event.player_index, player.position, bounds, player)
 end
 
 local function pause_state(state, player)
@@ -677,36 +766,58 @@ function slice.resume(player)
   return resume_state(surface_state(player.surface.index), player)
 end
 
-function slice.contextual_status(surface_index)
-  local state = surface_state(surface_index)
+function slice.contextual_status(surface_index, player_index)
+  local state = presented_state(surface_index, player_index)
   if not state.field or not state.job then return nil end
 
-  local machine = state.machine
-  local machine_entity = machine and movement.entity(machine)
+  local assigned_machine = state.job.machine_id and state.root.machines[state.job.machine_id] or nil
+  local assigned_entity = assigned_machine and movement.entity(assigned_machine) or nil
+  local available_machine = not assigned_machine and
+    compatible_machine(state.root, surface_index, state.job.operation or "cultivation", true) or nil
+  local available_entity = available_machine and movement.entity(available_machine) or nil
   local storage_inventory, storage_entity = destination_inventory(state)
   local eligible_storage = not storage_inventory and nearest_storage_container(state.field)
   if eligible_storage then storage_entity = eligible_storage end
   local requested_operation = state.job.state == "completed" and field_module.next_operation(state.field, game.tick) or nil
   local next_field_operation = requested_operation
+  local progress_operation = state.job.operation or requested_operation
   local unavailable_reason = nil
-  if requested_operation and not machine_entity then
+  local next_machine = requested_operation and compatible_machine(state.root, surface_index, requested_operation, false) or nil
+  if requested_operation and not next_machine then
     next_field_operation = nil
     unavailable_reason = "The farming tractor is missing."
-  elseif requested_operation and not operation_implement(machine, requested_operation) then
-    next_field_operation = nil
-    unavailable_reason = "The farming tractor lacks the required implement."
   elseif requested_operation == "harvesting" and not storage_inventory and not eligible_storage then
     next_field_operation = nil
     unavailable_reason = "Place a storage container within 32 tiles of the field entrance."
   end
 
+  local vehicle
+  if assigned_machine and assigned_entity then
+    vehicle = {name = "farming-tractor", unit_number = assigned_machine.unit_number,
+      state = state.job.state, assignment = "assigned"}
+  elseif available_machine and available_entity then
+    vehicle = {name = "farming-tractor", unit_number = available_machine.unit_number,
+      state = "ready", assignment = "available"}
+  else
+    vehicle = {name = "farming-tractor", unit_number = nil,
+      state = next_machine and "busy" or "missing", assignment = "unassigned"}
+  end
+
   return {
-    lifecycle = field_module.lifecycle(state.field, game.tick),
-    vehicle = {
-      name = "farming-tractor",
-      unit_number = machine and machine.unit_number or nil,
-      state = machine_entity and (state.job.state == "completed" and "ready" or state.job.state) or "missing"
+    field = {
+      id = state.field.id,
+      lifecycle = field_module.lifecycle(state.field, game.tick),
+      completed_area = progress_operation and field_module.operation_area(state.field, progress_operation) or 0,
+      total_area = state.field.area
     },
+    job = {
+      id = state.job.id,
+      state = state.job.state,
+      operation = progress_operation,
+      assigned_machine_id = state.job.machine_id
+    },
+    lifecycle = field_module.lifecycle(state.field, game.tick),
+    vehicle = vehicle,
     storage = {
       name = "farming-storage-container",
       unit_number = storage_entity and storage_entity.unit_number or state.field.storage_unit_number,
@@ -720,22 +831,20 @@ end
 
 start_next_operation = function(state, player)
   local job = state.job
-  local machine = state.machine
   if not job or job.state ~= "completed" then
     notify(player, "The field already has an active operation.")
     return false
   end
-  if not machine or not movement.entity(machine) then
-    notify(player, "Create a replacement tractor with /farming-slice-setup first.")
-    return false
-  end
+  local root = state.root or ensure_root()
   local operation_name = field_module.next_operation(state.field, game.tick)
   if not operation_name then
     notify(player, "Crops are still growing; no field operation is ready.")
     return false
   end
-  local implement, implement_error = operation_implement(machine, operation_name)
-  if not implement then notify(player, implement_error); return false, implement_error end
+  if not compatible_machine(root, state.field.surface_index, operation_name, false) then
+    notify(player, "Create a replacement tractor with /farming-slice-setup first.")
+    return false
+  end
   if operation_name == "harvesting" then
     local designated, message = designate_storage(state)
     if not designated then notify(player, message); return false end
@@ -746,10 +855,29 @@ start_next_operation = function(state, player)
   job.state = "waiting"
   job.failure = nil
   job.generation = job.generation + 1
-  if not reserve_job(state) then
-    fail_job(state, "The field-operation lane could not be claimed.", player)
-    return false
+  job.player_index = player and player.index or job.player_index
+  local surface = state.surface or surface_state(state.field.surface_index)
+  local primary_machine = surface.machine
+  -- Preserve the original one-field path: its surface alias owns the sole
+  -- ready tractor and starts immediately, rather than becoming a queued job.
+  -- A selected non-alias field, or a busy primary tractor, uses the shared
+  -- queue so selection cannot steal another field's assignment.
+  if surface.field == state.field and surface.job == job and primary_machine and
+     primary_machine.job_id == nil and movement.entity(primary_machine) then
+    if not reserve_job({machine = primary_machine, job = job, field = state.field}) then
+      fail_job({machine = primary_machine, job = job, field = state.field},
+        "The field-operation lane could not be claimed.", player)
+      return false
+    end
+    notify(player, "Tractor starting " .. operation_name .. ".")
+    return true
   end
+  local queued = false
+  for _, queued_job_id in ipairs(root.queued_job_ids) do
+    if queued_job_id == job.id then queued = true; break end
+  end
+  if not queued then root.queued_job_ids[#root.queued_job_ids + 1] = job.id end
+  dispatch_queued_jobs(root)
   notify(player, "Tractor starting " .. operation_name .. ".")
   return true
 end
@@ -758,13 +886,18 @@ function slice.show_contextual_action(player)
   local gui = player.gui.left
   local existing = gui.farming_field_action
   if existing then existing.destroy() end
-  local status = slice.contextual_status(player.surface.index)
+  local status = slice.contextual_status(player.surface.index, player.index)
   if not status then return end
   local frame = gui.add({type = "frame", name = "farming_field_action", direction = "vertical", caption = "Farming field"})
-  frame.add({type = "label", caption = "Status: " .. status.lifecycle})
+  frame.add({type = "label", name = "farming_field_identity", caption = "Field #" .. status.field.id})
+  frame.add({type = "label", name = "farming_field_lifecycle", caption = "Status: " .. status.lifecycle})
+  frame.add({type = "label", name = "farming_field_progress", caption = "Progress: " ..
+    status.field.completed_area .. "/" .. status.field.total_area .. " tiles (" ..
+    (status.job.operation or "awaiting operation") .. ", " .. status.job.state .. ")"})
   local vehicle = status.vehicle
   local vehicle_identity = vehicle.unit_number and ("#" .. vehicle.unit_number) or "unavailable"
-  frame.add({type = "label", caption = "Vehicle: farming tractor " .. vehicle_identity .. " (" .. vehicle.state .. ")"})
+  frame.add({type = "label", caption = "Vehicle: farming tractor " .. vehicle_identity .. " (" ..
+    vehicle.assignment .. ", " .. vehicle.state .. ")"})
   local storage = status.storage
   local storage_identity = storage.unit_number and ("#" .. storage.unit_number) or "none designated"
   frame.add({type = "label", caption = "Storage container: " .. storage_identity .. " (" .. storage.state .. ")"})
@@ -782,7 +915,7 @@ function slice.on_gui_click(event)
   if event.element and event.element.valid and event.element.name == "farming_field_primary_action" then
     local player = game.get_player(event.player_index)
     if player then
-      start_next_operation(surface_state(player.surface.index), player)
+      start_next_operation(presented_state(player.surface.index, player.index), player)
       slice.show_contextual_action(player)
     end
   end
@@ -1015,6 +1148,24 @@ function slice.debug_player_setup(player_index)
   return slice.setup(player)
 end
 
+-- Test/automation seam for the same planner-selection path used by the
+-- player event.  It supplies a player identity and position because headless
+-- Factorio does not create a connected LuaPlayer.
+function slice.debug_player_planner_selection(surface_index, player_index, player_position, bounds)
+  local normalized, normalize_error = field_module.normalize_selection({
+    left_top = {x = bounds.left, y = bounds.top},
+    right_bottom = {x = bounds.right, y = bounds.bottom}
+  })
+  if not normalized then return false, normalize_error end
+  return plan_field_selection(surface_index, player_index, player_position, normalized, nil)
+end
+
+function slice.debug_player_start_selected_operation(surface_index, player_index)
+  -- Matches the GUI handler's selected-field route while avoiding a connected
+  -- LuaPlayer requirement in the headless acceptance runtime.
+  return start_next_operation(presented_state(surface_index, player_index), {index = player_index})
+end
+
 function slice.debug_start_next_operation(surface_index)
   return start_next_operation(surface_state(surface_index))
 end
@@ -1216,6 +1367,25 @@ function slice.snapshot(surface_index)
         end
       end
       table.sort(result, function(a, b) return a.id < b.id end)
+      return result
+    end)(),
+    field_jobs = (function()
+      local result = {}
+      for _, live_job in pairs(root.jobs) do
+        local live_field = root.fields[live_job.field_id]
+        if live_field and live_field.surface_index == surface_index then
+          result[#result + 1] = {
+            id = live_job.id, field_id = live_field.id, state = live_job.state,
+            operation = live_job.operation, machine_id = live_job.machine_id,
+            failure = live_job.failure, lifecycle = field_module.lifecycle(live_field, game.tick),
+            cultivated_area = field_module.operation_area(live_field, "cultivation"),
+            sown_area = field_module.operation_area(live_field, "sowing"),
+            harvested_area = field_module.operation_area(live_field, "harvesting"),
+            total_area = live_field.area
+          }
+        end
+      end
+      table.sort(result, function(a, b) return a.field_id < b.field_id end)
       return result
     end)()
   }

@@ -1235,6 +1235,75 @@ local function run_contextual_action_tests()
   equal(status.next_field_operation, "cultivation", "contextual status exposes exactly the next valid field operation")
 end
 
+-- The planner remains the player-facing way to create and select fields.  A
+-- second selection must enqueue new cultivation without changing the original
+-- field, while re-selecting the first field only changes the player's
+-- presented context.
+local function run_player_multifield_selection_tests()
+  local surface = build_surface("player-multifield-selection")
+  local player_index = 1
+  local player_position = {x = -20, y = 8}
+  local created, create_error = remote.call("factorio_farming", "debug_add_tractor", surface.index, player_position)
+  truthy(created, create_error or "player-facing planner setup failed")
+
+  local function select(bounds)
+    local selected, selection_error = remote.call("factorio_farming", "debug_player_planner_selection",
+      surface.index, player_index, player_position, bounds)
+    truthy(selected, selection_error or "planner selection failed")
+  end
+
+  local first_bounds = {left = 0, top = 0, right = 64, bottom = 16}
+  local second_bounds = {left = 80, top = 0, right = 144, bottom = 16}
+  select(first_bounds)
+  local first_status = remote.call("factorio_farming", "contextual_status", surface.index, player_index)
+  truthy(first_status and first_status.field, "first planner selection exposes field context")
+  local first_id = first_status.field.id
+  truthy(first_id, "first planner selection has a durable field identity")
+  equal(first_status.next_field_operation, "cultivation", "first field requires one cultivation action")
+
+  select(second_bounds)
+  local second_status = remote.call("factorio_farming", "contextual_status", surface.index, player_index)
+  truthy(second_status and second_status.field, "second planner selection exposes field context")
+  truthy(second_status.field.id ~= first_id,
+    "second non-overlapping planner selection creates a distinct durable field")
+  equal(second_status.job.operation, "cultivation", "second field queues cultivation")
+  local after_second = snapshot(surface.index)
+  local second_job = queued_job(after_second, second_status.job.id)
+  truthy(second_job, "second player-created field has a durable queued job")
+
+  local rejected, rejection = remote.call("factorio_farming", "debug_player_planner_selection",
+    surface.index, player_index, player_position, {left = 32, top = 0, right = 96, bottom = 16})
+  truthy(not rejected and string.find(rejection or "", "overlap"),
+    "overlapping planner selection fails closed")
+  rejected, rejection = remote.call("factorio_farming", "debug_player_planner_selection",
+    surface.index, player_index, player_position, {left = 160, top = 0, right = 223, bottom = 16})
+  truthy(not rejected and string.find(rejection or "", "64"),
+    "invalid planner dimensions fail closed")
+  local after_rejections = snapshot(surface.index)
+  equal(#after_rejections.field_visuals, 2, "rejected planner selections do not create partial fields")
+
+  select(first_bounds)
+  local reselected = remote.call("factorio_farming", "contextual_status", surface.index, player_index)
+  equal(reselected.field.id, first_status.field.id, "reselecting a field changes only presented context")
+  local after_reselect = snapshot(surface.index)
+  local same_second_job = queued_job(after_reselect, second_status.job.id)
+  equal(same_second_job.machine_id, second_job.machine_id,
+    "field selection does not alter another tractor assignment")
+  equal(same_second_job.completed_area, second_job.completed_area,
+    "field selection does not alter another field's authoritative progress")
+
+  equal(reselected.field.lifecycle, "uncultivated", "selected field context exposes its lifecycle")
+  equal(reselected.field.completed_area, 0, "selected field context exposes exact operation progress")
+  equal(reselected.vehicle.state, "busy", "selected field context reports the shared tractor state")
+  equal(reselected.vehicle.assignment, "unassigned",
+    "selected queued field does not claim another field's busy tractor")
+  equal(reselected.vehicle.unit_number, nil,
+    "selected queued field does not display another field's tractor identity")
+  equal(reselected.storage.state, "unassigned", "selected field context reports storage state")
+  equal(reselected.next_field_operation, "cultivation",
+    "selected field context exposes exactly one valid manual next operation")
+end
+
 -- ------------------------------------------------------------ storage entity
 
 -- The storage container must be a real entity a player can obtain and place.
@@ -1852,6 +1921,171 @@ local function drive_replay(event)
   else drive_verify(event, phase) end
 end
 
+-- ------------------------------------------------ player multi-field flow
+
+local function field_job_state(snap, field_id)
+  for _, job in ipairs(snap.field_jobs or {}) do
+    if job.field_id == field_id then return job end
+  end
+  return nil
+end
+
+local function field_storage(surface_index, position)
+  local surface = game.get_surface(surface_index)
+  return surface.find_entities_filtered({type = "container", area = {
+    {position.x - 1, position.y - 1}, {position.x + 1, position.y + 1}
+  }})[1]
+end
+
+local function create_field_storage(surface_index, position)
+  local surface = game.get_surface(surface_index)
+  return surface.create_entity({name = "farming-storage-container", position = position, force = game.forces.player})
+end
+
+local function select_player_field(run, field)
+  local selected, selection_error = remote.call("factorio_farming", "debug_player_planner_selection",
+    run.surface, run.player_index, run.player_position, field.bounds)
+  truthy(selected, selection_error or "player planner selection failed")
+  local status = remote.call("factorio_farming", "contextual_status", run.surface, run.player_index)
+  equal(status.field.id, field.id, "planner selection did not present its field")
+  return status
+end
+
+local function init_player_multifield(capture)
+  local unavailable_surface = build_surface("player-multifield-unavailable")
+  local unavailable, unavailable_error = remote.call("factorio_farming", "debug_player_planner_selection",
+    unavailable_surface.index, 99, TRACTOR_POSITION, FIELD_BOUNDS)
+  truthy(not unavailable and string.find(unavailable_error or "", "setup"),
+    "planner fails closed when no tractor is available")
+
+  local surface = build_surface("player-multifield")
+  local player_index = 1
+  local created, create_error = remote.call("factorio_farming", "debug_add_tractor", surface.index, TRACTOR_POSITION)
+  truthy(created, create_error or "player multi-field tractor setup failed")
+  local first_bounds = {left = 0, top = 0, right = 64, bottom = 16}
+  local second_bounds = {left = 80, top = 0, right = 144, bottom = 16}
+  local first, first_error, first_id = remote.call("factorio_farming", "debug_player_planner_selection",
+    surface.index, player_index, TRACTOR_POSITION, first_bounds)
+  truthy(first, first_error or "first player field selection failed")
+  truthy(remote.call("factorio_farming", "debug_player_start_selected_operation", surface.index, player_index),
+    "first player field cultivation action failed")
+  local second, second_error, second_id = remote.call("factorio_farming", "debug_player_planner_selection",
+    surface.index, player_index, TRACTOR_POSITION, second_bounds)
+  truthy(second, second_error or "second player field selection failed")
+  storage.player_multifield = {
+    surface = surface.index, player_index = player_index, player_position = TRACTOR_POSITION,
+    first = {id = first_id, bounds = first_bounds, storage_position = {x = -10, y = 20}},
+    second = {id = second_id, bounds = second_bounds, storage_position = {x = 70, y = 20}},
+    capture = capture, started = game.tick, deadline = game.tick + 180000
+  }
+  -- The second field begins with storage so its full-storage recovery is a
+  -- real insertion failure. The first intentionally has no storage yet.
+  truthy(create_field_storage(surface.index, storage.player_multifield.second.storage_position),
+    "second field storage creation failed")
+end
+
+local function drive_player_multifield(event)
+  local run = storage.player_multifield
+  if mode == "player-multifield-replay" then
+    run.capture = false
+    run.replayed = true
+    if not run.replay_selection_checked then
+      local saved_status = remote.call("factorio_farming", "contextual_status", run.surface, run.player_index)
+      equal(saved_status.field.id, run.saved_selected_field_id,
+        "save/load restores the selected field before replay-side selection")
+      run.replay_selection_checked = true
+    end
+  end
+  local snap = snapshot(run.surface)
+  local first = field_job_state(snap, run.first.id)
+  local second = field_job_state(snap, run.second.id)
+  truthy(first and second, "player-created fields lost durable jobs")
+
+  if run.capture and not run.saved and first.state == "working" and first.cultivated_area >= 64 and
+     second.state == "waiting" then
+    run.saved = true
+    run.saved_selected_field_id = remote.call("factorio_farming", "contextual_status", run.surface, run.player_index).field.id
+    game.auto_save("player-multifield-working")
+    write_result("player-multifield-capture", {passed = true, saved = {"player-multifield-working"}, tick = event.tick,
+      first_field_id = first.field_id, second_field_id = second.field_id})
+    script.on_event(defines.events.on_tick, nil)
+    return
+  end
+  if event.tick > run.deadline then
+    write_result("player-multifield", {passed = false, reason = "timeout", snapshot = snap})
+    fail("player multi-field flow timed out")
+  end
+
+  for _, field in ipairs({run.first, run.second}) do
+    local job = field_job_state(snap, field.id)
+    if job.state == "failed" then
+      if field == run.first and run.first_storage_destroyed and not run.first_storage_recovered then
+        equal(job.harvested_area, 0, "missing storage retains every ready crop")
+        truthy(create_field_storage(run.surface, field.storage_position), "missing storage replacement failed")
+        truthy(remote.call("factorio_farming", "debug_resume", run.surface), "missing storage resume failed")
+        run.first_storage_recovered = true
+      elseif field == run.second and run.second_storage_full and not run.second_storage_recovered then
+        equal(job.harvested_area, 0, "full storage retains every ready crop")
+        local container = field_storage(run.surface, field.storage_position)
+        truthy(container and container.valid, "full storage container is missing")
+        container.destroy()
+        truthy(create_field_storage(run.surface, field.storage_position), "full storage replacement failed")
+        truthy(remote.call("factorio_farming", "debug_resume", run.surface), "full storage resume failed")
+        run.second_storage_recovered = true
+      else
+        fail("unexpected player multi-field job failure: " .. tostring(job.failure))
+      end
+      return
+    end
+    if job.state == "completed" and job.harvested_area < job.total_area then
+      local status = select_player_field(run, field)
+      if field == run.first and status.lifecycle == "ready" and not run.first_storage_available then
+        equal(status.next_field_operation, nil, "missing storage hides the harvest action")
+        truthy(string.find(status.unavailable_reason or "", "storage"), "missing storage explains the blocked harvest")
+        local container = create_field_storage(run.surface, field.storage_position)
+        truthy(container, "first field storage creation failed")
+        run.first_storage_unit_number = container.unit_number
+        run.first_storage_available = true
+        return
+      end
+      if status.next_field_operation == "harvesting" and field == run.second and not run.second_storage_full then
+        local inventory = field_storage(run.surface, field.storage_position).get_inventory(defines.inventory.chest)
+        while inventory.insert({name = "farming-wheat", count = 100}) > 0 do end
+        run.second_storage_full = true
+      end
+      if status.next_field_operation then
+        truthy(remote.call("factorio_farming", "debug_player_start_selected_operation", run.surface, run.player_index),
+          "selected field contextual action failed")
+        return
+      end
+    end
+  end
+
+  first = field_job_state(snapshot(run.surface), run.first.id)
+  if first.operation == "harvesting" and first.state == "working" and run.first_storage_available and
+     not run.first_storage_destroyed then
+    local container = field_storage(run.surface, run.first.storage_position)
+    truthy(container and container.valid, "first field storage was not designated")
+    container.destroy()
+    run.first_storage_destroyed = true
+    return
+  end
+
+  first = field_job_state(snapshot(run.surface), run.first.id)
+  second = field_job_state(snapshot(run.surface), run.second.id)
+  if first.harvested_area == first.total_area and second.harvested_area == second.total_area and
+     first.state == "completed" and second.state == "completed" then
+    local first_inventory = field_storage(run.surface, run.first.storage_position).get_inventory(defines.inventory.chest)
+    local second_inventory = field_storage(run.surface, run.second.storage_position).get_inventory(defines.inventory.chest)
+    equal(first_inventory.get_item_count("farming-wheat"), 1024, "first player field stores exact wheat")
+    equal(second_inventory.get_item_count("farming-wheat"), 1024, "second player field stores exact wheat after full recovery")
+    write_result(run.replayed and "player-multifield-replay" or "player-multifield",
+      {passed = true, replayed = run.replayed or false, tick = event.tick,
+      first_wheat = first_inventory.get_item_count("farming-wheat"), second_wheat = second_inventory.get_item_count("farming-wheat")})
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
 -- ----------------------------------------------------------------- dispatch
 
 local initializers = {
@@ -1865,6 +2099,8 @@ local initializers = {
   ["implement-overlays"] = init_implement_overlays,
   ["queue-capture"] = init_queue_capture,
   ["fleet-capture"] = init_fleet_capture
+  , ["player-multifield"] = function() init_player_multifield(false) end
+  , ["player-multifield-capture"] = function() init_player_multifield(true) end
 }
 
 local drivers = {
@@ -1881,6 +2117,9 @@ local drivers = {
   ["queue-replay"] = drive_queue_verify,
   ["fleet-capture"] = drive_fleet_capture,
   ["fleet-replay"] = drive_fleet_verify
+  , ["player-multifield"] = drive_player_multifield
+  , ["player-multifield-capture"] = drive_player_multifield
+  , ["player-multifield-replay"] = drive_player_multifield
 }
 
 script.on_init(function()
@@ -1888,6 +2127,7 @@ script.on_init(function()
   run_storage_prototype_tests()
   run_storage_placement_tests()
   run_contextual_action_tests()
+  run_player_multifield_selection_tests()
   local initialize = initializers[mode]
   if not initialize then fail("mode '" .. tostring(mode) .. "' does not create a map") end
   initialize()
