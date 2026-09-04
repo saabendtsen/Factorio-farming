@@ -169,6 +169,22 @@ else {
   else { Write-Fail "crop cycle acceptance flow"; Show-ScriptError "cycle" }
 }
 
+Write-Stage "Player-created multi-field crop-cycle acceptance flow"
+Set-TestMode "player-multifield"
+$playerMultifieldSave = Join-Path $RunRoot "player-multifield-test.zip"
+Invoke-Factorio "player-multifield-create" @("--create", $playerMultifieldSave) | Out-Null
+if (-not (Test-Path $playerMultifieldSave)) { Write-Fail "player multi-field map creation" }
+else {
+  Invoke-Factorio "player-multifield" @("--benchmark", $playerMultifieldSave, "--benchmark-ticks", "30000", "--benchmark-runs", "1") | Out-Null
+  $playerMultifield = Get-Result "player-multifield"
+  if ($playerMultifield -and $playerMultifield.passed) {
+    Write-Pass "player multi-field: two planner-created fields stored exact wheat after storage recovery"
+  } else {
+    Write-Fail "player multi-field crop cycle"
+    Show-ScriptError "player-multifield"
+  }
+}
+
 # ----------------------------------------------------------- crop capture
 
 Write-Stage "Shared queue scheduler acceptance flow"
@@ -299,6 +315,20 @@ if (-not $cycleCaptureOutcome.SaveCreated) {
   Show-ScriptError "cycle-capture"
 }
 
+Write-Stage "Player multi-field save/load capture"
+$capturedPlayerMultifieldPhases = @()
+$playerMultifieldCaptureOutcome = Invoke-RealtimeCapture "player-multifield-capture" 4
+$playerMultifieldCapture = $playerMultifieldCaptureOutcome.Result
+if (-not $playerMultifieldCaptureOutcome.SaveCreated) {
+  Write-Fail "player multi-field save/load capture map creation"
+} elseif ($playerMultifieldCapture.passed) {
+  $capturedPlayerMultifieldPhases = @($playerMultifieldCapture.saved)
+  Write-Pass "captured player multi-field phases: $($capturedPlayerMultifieldPhases -join ', ')"
+} else {
+  Write-Fail "player multi-field save/load capture"
+  Show-ScriptError "player-multifield-capture"
+}
+
 # ------------------------------------------------------------------ capture
 
 Write-Stage "Stage 2/4  capture a save in every controller phase"
@@ -358,6 +388,10 @@ $specialReplays = @(
   [pscustomobject]@{
     Phase = "fleet-working"; Captured = $capturedFleetPhases; Mode = "fleet-replay"; Ticks = "90000"
     Label = "fleet"; Pass = "active overlays rebuilt, all fields completed exactly, and overlays disposed"
+  },
+  [pscustomobject]@{
+    Phase = "player-multifield-working"; Captured = $capturedPlayerMultifieldPhases; Mode = "player-multifield-replay"; Ticks = "30000"
+    Label = "player multi-field"; Pass = "player-selected fields resumed and stored exact wheat after load"
   }
 )
 
@@ -375,7 +409,7 @@ foreach ($replay in $specialReplays) {
   }
   Set-TestMode $replay.Mode
   Invoke-Factorio "saveload-$phase" @("--benchmark", $save.FullName, "--benchmark-ticks", $replay.Ticks, "--benchmark-runs", "1") | Out-Null
-  $result = Get-Result "saveload-$phase"
+  $result = if ($replay.Label -eq "player multi-field") { Get-Result "player-multifield-replay" } else { Get-Result "saveload-$phase" }
   if ($result -and $result.passed) {
     Write-Pass "$($replay.Label) save/load ${phase}: $($replay.Pass)"
   } else {

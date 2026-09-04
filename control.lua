@@ -45,6 +45,8 @@ remote.add_interface("factorio_farming", {
   debug_seed_crop_stage = slice.debug_seed_crop_stage,
   debug_mark_visuals_dirty = slice.debug_mark_visuals_dirty,
   debug_player_setup = slice.debug_player_setup,
+  debug_player_planner_selection = slice.debug_player_planner_selection,
+  debug_player_start_selected_operation = slice.debug_player_start_selected_operation,
   snapshot = slice.snapshot,
   debug_profile_start = slice.debug_profile_start,
   debug_profile_stop = slice.debug_profile_stop,
