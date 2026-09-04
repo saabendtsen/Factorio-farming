@@ -1820,9 +1820,12 @@ local function drive_verify(event, phase)
     -- The one-outstanding-request budget still holds immediately after a load.
     truthy(snap.pending_path_count <= 1, phase .. " exceeded the outstanding path budget after load")
     if phase == "reserved" or phase == "travelling" then
-      -- The saved request is discarded and a fresh one is issued, rather than
-      -- the stale in-flight path being trusted.
-      equal(snap.machine.controller_state, "requesting", phase .. " did not reissue its path after load")
+      -- The saved request is discarded and a fresh request is either queued
+      -- for the regular path-queue pass or already requesting.  Depending on
+      -- mod event ordering this first post-load observation can precede that
+      -- pass; exact completion below proves the queued request is not stuck.
+      truthy(snap.machine.controller_state == "queued" or snap.machine.controller_state == "requesting",
+        phase .. " did not queue or reissue its path after load")
     elseif phase == "working" then
       equal(snap.job.state, "working", "working save did not load working")
     elseif phase == "paused" then
