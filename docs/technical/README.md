@@ -10,6 +10,6 @@ The [first production vertical slice](first-production-vertical-slice.md) fixes 
 
 The [whole-field cultivation extension](whole-field-cultivation.md) records the next accepted production increment: four exact lanes, generated physical headland turns, full persistent coverage, and updated save/load and performance evidence.
 
-The [production fleet scale characterization](fleet-scale-characterization.md) defines the deterministic multi-field evidence ledger for 2, 10, 25, and 50 concurrently active tractors, with a gated 100-tractor stretch case.
+The [production fleet scale characterization](fleet-scale-characterization.md) describes the deterministic multi-field evidence ledger the harness is built to produce for 2, 10, 25, and 50 concurrently active tractors, with a gated 100-tractor stretch case. It records a measurement design and its reproducible command, not a delivered result: the ledger's results table is still awaiting the serialized run, and no fleet size beyond the two-tractor acceptance case has a recorded passing measurement.
 
 See the repository [task tracker](../../TASKS.md) for current scope and status.
