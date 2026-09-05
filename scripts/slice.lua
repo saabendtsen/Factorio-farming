@@ -1054,9 +1054,13 @@ local function tick_body(event)
   local root = ensure_root()
   dispatch_queued_jobs(root)
   promote_reserved(root)
-  local queued_paths_before = #root.path_queue
-  local outstanding_before = root.outstanding_path_id and 1 or 0
   movement.process_path_queue(event.tick)
+  -- Measurement only: sample the queue after it has been processed so the
+  -- telemetry published at the end of this tick describes the tick it is
+  -- labelled with. Sampling before the queue ran published a one-tick-stale
+  -- depth, which shifted every observed drain window by a tick.
+  local queued_paths_now = #root.path_queue
+  local outstanding_now = root.outstanding_path_id and 1 or 0
   local due = {}
   local active = 0
   for _, work_field in pairs(root.fields) do
@@ -1095,7 +1099,7 @@ local function tick_body(event)
   end
   visuals.update()
   last_tick_telemetry = {controller_due = #due, controller_updated_machine_id = updated_machine_id,
-    path_queue_depth = queued_paths_before, outstanding_paths = outstanding_before}
+    path_queue_depth = queued_paths_now, outstanding_paths = outstanding_now}
   return active
 end
 
