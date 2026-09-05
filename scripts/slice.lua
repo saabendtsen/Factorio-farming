@@ -861,10 +861,15 @@ start_next_operation = function(state, player)
   job.implement = operation_name
   job.state = "waiting"
   job.failure = nil
-  -- The initial player-visible field is reserved immediately, unlike queued
-  -- fleet jobs. Keep the same request timestamp so the production scale ledger
-  -- can measure dispatch latency across both paths.
-  job.request_tick = game.tick
+  -- Measurement only, and deliberately NOT `request_tick`. `request_tick` is
+  -- the scheduler's equal-priority tie-break (`field.job_precedes`), so
+  -- re-stamping it here would make a restarted field lose ties it used to win.
+  -- The initial player-visible field's job is created by `create_field_job`
+  -- without a `request_tick` at all, so the scale ledger has nothing to measure
+  -- its dispatch latency from; this separate stamp gives it one.
+  -- `field.job_precedes` reads only `priority`, `request_tick` and `id`, so
+  -- nothing in the scheduler consults this field.
+  job.last_operation_tick = game.tick
   job.generation = job.generation + 1
   job.player_index = player and player.index or job.player_index
   local surface = state.surface or surface_state(state.field.surface_index)
@@ -1310,7 +1315,8 @@ function slice.snapshot(surface_index)
     if live_field and live_field.surface_index == surface_index then
       all_jobs[#all_jobs + 1] = {id = live_job.id, field_id = live_job.field_id, state = live_job.state,
         operation = live_job.operation, machine_id = live_job.machine_id, priority = live_job.priority,
-        request_tick = live_job.request_tick, failure = live_job.failure,
+        request_tick = live_job.request_tick, last_operation_tick = live_job.last_operation_tick,
+        generation = live_job.generation, failure = live_job.failure,
         completed_area = live_field.completed_area, total_area = live_field.area,
         cultivated_area = field_module.operation_area(live_field, "cultivation"),
         sown_area = field_module.operation_area(live_field, "sowing"),
@@ -1397,6 +1403,10 @@ function slice.snapshot(surface_index)
       return result
     end)(),
     pending_path_count = ensure_root().outstanding_path_id and 1 or 0,
+    -- The engine's own request id, published so a load can be checked for
+    -- having discarded the *saved* request rather than merely for having no
+    -- request at all. Measurement only; nothing reads it back.
+    pending_path_id = ensure_root().outstanding_path_id,
     visual_count = work_field and visuals.object_count(work_field.id) or 0,
     -- Every live field on the surface reports its own projection, so selected
     -- and non-selected fields are observable apart from each other.
