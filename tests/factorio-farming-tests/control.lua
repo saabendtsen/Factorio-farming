@@ -13,7 +13,27 @@ local PROFILE_DELAY = 10
 -- prove they really did initialize lazily on load instead of asserting it.
 local on_init_ran = false
 
+-- A stage that has claimed a result name gets a `passed = false` result written
+-- for it before any `fail()` propagates. Without this, every `truthy`/`equal`
+-- inside a driver errors out having written nothing at all, and the harness
+-- cannot tell an assertion miss from a crash -- which is exactly what the scale
+-- documentation used to claim could not happen. Upvalues, not storage: they
+-- describe this session's in-flight stage, not durable state.
+local write_result
+local active_result_name = nil
+local active_result_written = false
+
+local function claim_result(name)
+  active_result_name = name
+  active_result_written = false
+end
+
 local function fail(message)
+  if active_result_name and not active_result_written then
+    -- Never let the reporting path mask the original failure.
+    pcall(write_result, active_result_name, {passed = false, reason = message,
+      reported_by = "assertion"})
+  end
   error("FACTORIO_FARMING_TEST_FAILURE: " .. message)
 end
 
@@ -27,7 +47,8 @@ local function truthy(value, message)
   if not value then fail(message) end
 end
 
-local function write_result(name, result)
+write_result = function(name, result)
+  if name == active_result_name then active_result_written = true end
   helpers.write_file(
     "factorio-farming-tests/" .. name .. ".json",
     helpers.table_to_json(result),
@@ -439,9 +460,16 @@ local function build_scale_surface(name, count)
       end
     end
     surface.force_generate_chunk_requests()
+    -- Half-open on the far edge. A tile at integer coordinate `c` occupies
+    -- [c, c + 1), so an inclusive loop up to `band.right` would pave one tile
+    -- past the band and make the real paved rectangle 101 x 33 -- shrinking the
+    -- measured gaps to 59 and 31 while `ledger.geometry_violations` still
+    -- asserted 60 and 32. The paved tiles now cover exactly
+    -- [band.left, band.right) x [band.top, band.bottom): 100 x 32, the extent
+    -- the geometry invariant is stated over.
     local tiles = {}
-    for y = spec.band.top, spec.band.bottom do
-      for x = spec.band.left, spec.band.right do
+    for y = spec.band.top, spec.band.bottom - 1 do
+      for x = spec.band.left, spec.band.right - 1 do
         tiles[#tiles + 1] = {name = "lab-dark-1", position = {x = x, y = y}}
       end
     end
@@ -719,7 +747,11 @@ local SCALE_RECOVERY_SIZES = {10, 50}
 -- The harness runs each scale benchmark for `count * SCALE_WINDOW_TICKS_PER_TRACTOR
 -- + SCALE_BENCHMARK_MARGIN_TICKS` ticks. Every deadline in this file has to
 -- fire inside that window: a deadline past the end of the benchmark produces
--- no result JSON at all, which is indistinguishable from a crash.
+-- no result JSON at all, which is indistinguishable from a crash. An assertion
+-- miss inside a scale stage does write one: `claim_result` names the stage and
+-- `fail` writes a `passed = false` result before it errors. A deadline that
+-- never fires still writes nothing, because nothing ever runs to write it --
+-- which is why the clamping below exists.
 local SCALE_WINDOW_TICKS_PER_TRACTOR = 18000
 local SCALE_BENCHMARK_MARGIN_TICKS = 1000
 -- Every deadline is clamped this far inside the benchmark margin, leaving the
@@ -729,6 +761,11 @@ local SCALE_DEADLINE_MARGIN_TICKS = 500
 -- eight minutes, so their in-game deadline has to fire first (7.5 minutes at
 -- 60 UPS) or a stuck capture writes no evidence either.
 local SCALE_CAPTURE_WINDOW_TICKS = 27000
+-- How long a replay waits for the production mod's load recovery to become
+-- observable before treating its absence as a failure. Mod `on_tick` ordering
+-- decides whether recovery has already run when the test driver first looks,
+-- so this is a bounded wait rather than a first-tick assertion.
+local SCALE_RECOVERY_OBSERVATION_TICKS = 180
 
 -- Sampling the production snapshot walks every machine, field, job and queued
 -- job, so a per-tick sample makes the measurement itself O(N^2) over the
@@ -780,7 +817,14 @@ local function scale_window_ticks(count, capture)
   return count * SCALE_WINDOW_TICKS_PER_TRACTOR + SCALE_BENCHMARK_MARGIN_TICKS - SCALE_DEADLINE_MARGIN_TICKS
 end
 
+local function scale_result_name(count, capture)
+  return "scale-" .. tostring(count) .. (capture and "-capture" or "")
+end
+
 local function init_scale(count, capture)
+  -- Claimed before the fixture is built, so a fixture assertion that fires
+  -- during `on_init` still leaves a `passed = false` result behind.
+  claim_result(scale_result_name(count, capture))
   local fixture = create_scale_fixture(count, (capture and "capture-" or "") .. tostring(count))
   local window = scale_window_ticks(count, capture)
   local interval = capture and SCALE_CAPTURE_SAMPLE_INTERVAL_TICKS or SCALE_SAMPLE_INTERVAL_TICKS
@@ -840,6 +884,11 @@ local function capture_scale_recovery(run, snap)
     "scale recovery capture requires a real pending path request to invalidate")
   local captured = {count = run.count, surface = run.surface, ids = run.ids, coverage = {}, generations = {},
     capture_tick = snap.tick, pending_path_count = snap.pending_path_count,
+    -- The engine request id in flight at the instant of the save. The replay
+    -- proves the load discarded *this* request, which is the actual invariant;
+    -- "no request exists after the load" is not, because recovery immediately
+    -- reissues one.
+    pending_path_id = snap.pending_path_id,
     path_queue_depth = snap.path_queue_depth, outstanding_paths = snap.outstanding_paths}
   for _, id in ipairs(run.ids) do
     local job = scale_job(snap, id)
@@ -857,6 +906,9 @@ end
 
 local function drive_scale(event)
   local run = storage.scale_run
+  -- Re-claimed every tick: `claim_result` is an upvalue, and a benchmark
+  -- session that loaded rather than initialized never ran `init_scale`.
+  claim_result(mode)
   local deadline = math.min(run.crop_seeded and run.visual_deadline or run.deadline, run.hard_deadline)
   -- Snapshotting is the expensive part of the measurement, so it happens on
   -- the declared interval. The deadline tick is always inspected as well, so a
@@ -950,6 +1002,12 @@ local function ensure_scale_replay()
     constructed_without_on_init = not on_init_ran,
     sample_interval = SCALE_SAMPLE_INTERVAL_TICKS,
     deadline = game.tick + window,
+    -- Whether the production mod's load recovery is already visible on the
+    -- first post-load tick is mod event ordering, not an invariant. Give it a
+    -- bounded number of ticks -- three seconds of game time, and orders of
+    -- magnitude inside the benchmark window -- before calling it a failure.
+    recovery_observation_deadline = game.tick +
+      math.min(SCALE_RECOVERY_OBSERVATION_TICKS, window),
     ledger = scale_ledger.new({label = "fleet-" .. tostring(saved.count) .. "-replay", fleet_size = saved.count,
       field_count = saved.count, window_ticks = window,
       sample_interval_ticks = SCALE_SAMPLE_INTERVAL_TICKS})}
@@ -957,6 +1015,10 @@ local function ensure_scale_replay()
 end
 
 local function drive_scale_replay(event)
+  -- Claimed before `ensure_scale_replay`, which itself asserts, so even a
+  -- missing capture fixture leaves a `passed = false` result behind. The mode
+  -- name is exactly the result name the harness looks for.
+  claim_result(mode)
   local replay = ensure_scale_replay()
   local saved = replay.saved
   local deadline = replay.deadline
@@ -971,43 +1033,82 @@ local function drive_scale_replay(event)
     truthy(saved.pending_path_count > 0, "scale replay fixture had no pending path to invalidate")
 
     -- Lazy recovery initialization, measured rather than asserted. Two
-    -- independent observations have to hold on this, the first tick after the
-    -- load:
+    -- independent observations have to hold once the load has settled:
     --   1. this driver was constructed without `on_init` having run, so the
     --      test mod really did initialize lazily from the loaded save; and
     --   2. the production mod's `slice.on_load` / `recover_loaded_state` pass
     --      has already run, which is observable because it is the only thing
     --      that populates `recovered_completed_area` on a job snapshot.
+    --
+    -- Observation (2) is *not* guaranteed on the first post-load tick: whether
+    -- the production mod's `on_tick` runs before this one is mod event
+    -- ordering, which this file already documents for the two-tractor gate.
+    -- So the observations are deferred to the first tick on which recovery is
+    -- actually visible, within a bounded wait well inside the benchmark window.
+    -- A wait that runs out is still a real failure.
     local recovered_jobs = 0
     for _, id in ipairs(saved.ids) do
       local queued = queued_job(snap, id)
       if queued and queued.recovered_completed_area ~= nil then recovered_jobs = recovered_jobs + 1 end
     end
-    replay.lazy_recovery_observed = replay.constructed_without_on_init and recovered_jobs > 0
     replay.recovered_job_count = recovered_jobs
+    replay.recovery_observation_ticks = event.tick - replay.started
+    if recovered_jobs == 0 and event.tick < replay.recovery_observation_deadline then return end
+
+    replay.lazy_recovery_observed = replay.constructed_without_on_init and recovered_jobs > 0
     truthy(replay.constructed_without_on_init,
       "loaded scale replay ran on_init, so its driver was not lazily initialized")
     truthy(recovered_jobs > 0,
-      "loaded scale replay observed no production load recovery on its first tick")
-
-    -- Pending-path cleanup, measured from the snapshot: `recover_loaded_state`
-    -- drops every in-flight path request, so the first tick after the load
-    -- must report no outstanding engine request even though the save was taken
-    -- while one was in flight.
-    replay.pending_path_cleaned = snap.pending_path_count == 0
-    truthy(replay.pending_path_cleaned,
-      "loaded scale replay carried a saved pending path request into the new session")
+      "loaded scale replay observed no production load recovery within " ..
+      tostring(replay.recovery_observation_ticks) .. " ticks of the load")
 
     for _, id in ipairs(saved.ids) do
       local job = scale_job(snap, id)
       truthy(job, "scale replay lost captured job " .. tostring(id))
       truthy(job.completed_area >= saved.coverage[id], "scale replay rewound authoritative coverage")
     end
+
+    -- Stale-callback invalidation. `recover_loaded_state` bumps every recovered
+    -- machine's generation, so a saved asynchronous callback can no longer be
+    -- believed. This is the strongest available evidence and it is checked
+    -- first, because the pending-path observations below lean on it.
+    local generations_advanced = true
     for _, machine in ipairs(snap.machines or {}) do
       local generation = saved.generations[machine.id]
+      if not (generation == nil or machine.generation > generation) then generations_advanced = false end
       truthy(generation == nil or machine.generation > generation,
         "scale replay trusted a stale controller callback for tractor " .. tostring(machine.id))
     end
+    replay.generations_advanced = generations_advanced
+
+    -- Pending-path cleanup. The invariant is that the SAVED request was
+    -- discarded, not that no request exists: `recover_loaded_state` clears the
+    -- saved id and `promote_reserved` -> `begin_travel` -> `movement.queue` ->
+    -- `movement.process_path_queue` can already have issued a fresh one on the
+    -- same tick, so `pending_path_count == 0` is not the invariant and would
+    -- fail on a correct run. What is measured instead:
+    --   * the outstanding-request budget of one still holds after the load
+    --     (the same gate `drive_verify` uses for the two-tractor case), and
+    --   * the id in flight now is not the id that was in flight at the save.
+    -- The capture only happens after every job is assigned and a field has
+    -- advanced, so many path requests have already been issued and the saved id
+    -- is far from the first id a fresh session hands out; the recorded ids are
+    -- written into the result either way, so the reading is checkable.
+    replay.pending_path_budget_held = snap.pending_path_count <= 1
+    replay.saved_pending_path_id = saved.pending_path_id
+    replay.post_load_pending_path_id = snap.pending_path_id
+    replay.pending_path_invalidated = snap.pending_path_id == nil or
+      saved.pending_path_id == nil or snap.pending_path_id ~= saved.pending_path_id
+    truthy(replay.pending_path_budget_held,
+      "loaded scale replay exceeded the outstanding path budget after load")
+    truthy(replay.pending_path_invalidated,
+      "loaded scale replay still holds the path request id that was saved (" ..
+      tostring(saved.pending_path_id) .. ")")
+    -- The published gate the harness reads: the saved request was invalidated,
+    -- the budget held, and every recovered controller generation moved on.
+    replay.pending_path_cleaned = replay.pending_path_invalidated and
+      replay.pending_path_budget_held and generations_advanced
+
     replay.recovered = true
   end
   if scale_jobs_complete(snap, saved) then
@@ -1021,10 +1122,16 @@ local function drive_scale_replay(event)
       captured_path_queue_depth = saved.path_queue_depth,
       captured_outstanding_paths = saved.outstanding_paths,
       sample_interval_ticks = replay.sample_interval,
-      -- Both fields below are observations from the first post-load tick, not
-      -- literals: see the recovery block above.
+      -- Every field below is an observation made on the tick the load became
+      -- observable, not a literal: see the recovery block above.
       lazy_recovery_initialization = replay.lazy_recovery_observed,
       recovered_jobs_observed = replay.recovered_job_count,
+      recovery_observed_after_ticks = replay.recovery_observation_ticks,
+      saved_pending_path_id = replay.saved_pending_path_id,
+      post_load_pending_path_id = replay.post_load_pending_path_id,
+      pending_path_invalidated = replay.pending_path_invalidated,
+      pending_path_budget_held = replay.pending_path_budget_held,
+      controller_generations_advanced = replay.generations_advanced,
       pending_path_cleaned = replay.pending_path_cleaned, ledger = report})
     script.on_event(defines.events.on_tick, nil)
     return
@@ -1035,6 +1142,13 @@ local function drive_scale_replay(event)
         " tractor replay did not complete every field within " .. tostring(event.tick - replay.started) .. " ticks",
       sample_interval_ticks = replay.sample_interval,
       lazy_recovery_initialization = replay.lazy_recovery_observed,
+      recovered_jobs_observed = replay.recovered_job_count,
+      recovery_observed_after_ticks = replay.recovery_observation_ticks,
+      saved_pending_path_id = replay.saved_pending_path_id,
+      post_load_pending_path_id = replay.post_load_pending_path_id,
+      pending_path_invalidated = replay.pending_path_invalidated,
+      pending_path_budget_held = replay.pending_path_budget_held,
+      controller_generations_advanced = replay.generations_advanced,
       pending_path_cleaned = replay.pending_path_cleaned,
       ledger = scale_ledger.summarize(replay.ledger), snapshot = snap})
     fail("production scale replay timed out")
