@@ -31,7 +31,11 @@ return function(ledger, assertions)
   local empty_report = ledger.summarize(empty)
   equal(empty_report.samples, 0, "empty ledger samples")
   equal(empty_report.ticks_observed, 0, "empty ledger observed ticks")
-  equal(empty_report.controller_saturation_permille, 0, "empty ledger saturation")
+  -- Saturation is a ratio of served to demanded controller updates. With no
+  -- demand there is no ratio, and reporting a number here would let a fixture
+  -- that never activated a tractor score as perfectly served.
+  equal(empty_report.controller_saturation_permille, nil, "empty ledger reports no saturation ratio")
+  equal(empty_report.controller_demand_observed, false, "empty ledger observed no controller demand")
   equal(#empty_report.violations, 0, "empty ledger violations")
   equal(empty_report.fleet_size, 2, "empty ledger fleet size")
 
@@ -75,7 +79,12 @@ return function(ledger, assertions)
   ledger.record(idle, sample(11, {controller_due = 0, controller_updated_machine_id = nil}))
   local idle_report = ledger.summarize(idle)
   equal(idle_report.controller_deferred_total, 0, "idle deferrals")
-  equal(idle_report.controller_saturation_permille, 1000, "idle service ratio is fully served")
+  -- A window in which nothing was ever due is a dead run, not a perfect one:
+  -- there is no denominator, so the ledger reports no ratio at all rather than
+  -- the full-marks 1000 an empty denominator would otherwise produce.
+  equal(idle_report.controller_saturation_permille, nil, "an undemanded window reports no saturation ratio")
+  equal(idle_report.controller_demand_observed, false, "an undemanded window records that it saw no demand")
+  equal(saturated_report.controller_demand_observed, true, "a demanded window records that it saw demand")
   equal(idle_report.first_tick, 10, "idle first tick")
   equal(idle_report.last_tick, 11, "idle last tick")
   equal(idle_report.ticks_observed, 2, "idle observed ticks")
@@ -100,6 +109,22 @@ return function(ledger, assertions)
   equal(drained_report.path.drain_windows, 1, "completed path drain window")
   equal(drained_report.path.drain_ticks_total, 2, "path queue drain duration")
   equal(drained_report.path.drain_ticks_max, 2, "longest path queue drain")
+  equal(drained_report.path.drain_started_tick, nil, "a fully drained window reports no open drain")
+  equal(drained_report.path.drain_open_ticks, 0, "a fully drained window reports zero open drain ticks")
+
+  -- A drain window still open when the window ends never closes, so it would
+  -- otherwise be dropped from `drain_windows`/`drain_ticks_total` entirely --
+  -- and at scale the longest drain is exactly the one most likely to still be
+  -- open when a run times out. The open window has to stay visible.
+  local open_drain = ledger.new({label = "open-drain", fleet_size = 2, field_count = 2, window_ticks = 5})
+  ledger.record(open_drain, sample(10, {path_queue_depth = 0, outstanding_paths = 0}))
+  ledger.record(open_drain, sample(11, {path_queue_depth = 2, outstanding_paths = 1}))
+  ledger.record(open_drain, sample(14, {path_queue_depth = 1, outstanding_paths = 1}))
+  local open_report = ledger.summarize(open_drain)
+  equal(open_report.path.drain_windows, 0, "an unterminated drain window is not counted as completed")
+  equal(open_report.path.drain_ticks_total, 0, "an unterminated drain window adds no completed drain ticks")
+  equal(open_report.path.drain_started_tick, 11, "the summary names the tick the open drain window started")
+  equal(open_report.path.drain_open_ticks, 3, "the summary reports how long the open drain window has run")
 
   local dispatch = ledger.new({label = "dispatch", fleet_size = 2, field_count = 2, window_ticks = 2})
   ledger.record(dispatch, sample(20, {jobs = {
@@ -120,6 +145,36 @@ return function(ledger, assertions)
   equal(dispatch_report.dispatch.jobs[1].assigned_tick, 20, "dispatch records first assignment tick")
   equal(dispatch_report.dispatch.jobs[1].latency_ticks, 2, "dispatch records first assignment latency")
   equal(dispatch_report.dispatch.jobs[2].machine_id, 2, "later job records its own tractor")
+  equal(dispatch_report.dispatch.jobs[1].request_tick_source, "request",
+    "a queued job measures latency from its own request tick")
+  equal(dispatch_report.dispatch.jobs_without_request_tick, 0,
+    "every dispatched job in this window carried a request tick")
+
+  -- The initial player-visible field's job is created without a request tick
+  -- (`create_field_job` in scripts/slice.lua), so the ledger falls back to the
+  -- operation tick the production code records for measurement. The fallback
+  -- has to be named in the row, not silently substituted.
+  local aliased = ledger.new({label = "aliased", fleet_size = 1, field_count = 1, window_ticks = 2})
+  ledger.record(aliased, sample(30, {jobs = {
+    {id = 1, last_operation_tick = 25, machine_id = 1, state = "reserved",
+      completed_area = 0, total_area = 1024}
+  }}))
+  local aliased_report = ledger.summarize(aliased)
+  equal(aliased_report.dispatch.jobs_assigned, 1, "the alias path still records its dispatch")
+  equal(aliased_report.dispatch.jobs[1].request_tick, 25, "the alias path falls back to its operation tick")
+  equal(aliased_report.dispatch.jobs[1].latency_ticks, 5, "the alias path measures latency from the fallback")
+  equal(aliased_report.dispatch.jobs[1].request_tick_source, "operation",
+    "the alias path names the fallback it measured from")
+  equal(#aliased_report.violations, 0, "the fallback is not an authority violation")
+
+  -- A job with neither tick is still a violation: latency would be fabricated.
+  local untimed = ledger.new({label = "untimed", fleet_size = 1, field_count = 1, window_ticks = 2})
+  ledger.record(untimed, sample(30, {jobs = {
+    {id = 1, machine_id = 1, state = "reserved", completed_area = 0, total_area = 1024}
+  }}))
+  local untimed_report = ledger.summarize(untimed)
+  equal(#untimed_report.violations, 1, "an assigned job with no timestamp at all is a violation")
+  equal(untimed_report.dispatch.jobs_without_request_tick, 1, "the untimed assignment is counted")
 
   -- Visual objects scale with the field count, so the ledger tracks their peak
   -- and mean the same way.
@@ -174,6 +229,38 @@ return function(ledger, assertions)
   truthy(string.find(broken_report.violations[2], "coverage"), "coverage rewind is reported")
   truthy(string.find(broken_report.violations[3], "exceeds"), "coverage overrun is reported")
   equal(broken_report.samples, 3, "violating samples are still recorded")
+
+  -- Coverage monotonicity is a within-operation invariant, not a per-job-id
+  -- one. `start_next_operation` reuses the job id and `field.begin_operation`
+  -- resets `completed_area`, so a field advancing to its second operation is a
+  -- legitimate reset, and flagging it would fail an otherwise correct run.
+  local second_operation = ledger.new({label = "second-operation", fleet_size = 1, field_count = 1,
+    window_ticks = 3})
+  ledger.record(second_operation, sample(1, {jobs = {
+    {id = 1, generation = 1, operation = "cultivation", state = "working",
+      completed_area = 1024, total_area = 1024}}}))
+  ledger.record(second_operation, sample(2, {jobs = {
+    {id = 1, generation = 2, operation = "sowing", state = "working",
+      completed_area = 0, total_area = 1024}}}))
+  ledger.record(second_operation, sample(3, {jobs = {
+    {id = 1, generation = 2, operation = "sowing", state = "working",
+      completed_area = 256, total_area = 1024}}}))
+  local second_report = ledger.summarize(second_operation)
+  equal(#second_report.violations, 0, "a new operation on the same job id is not a coverage rewind")
+  equal(second_report.coverage.completed, 256, "coverage reports the current operation, not the previous one")
+
+  -- Within one operation a rewind is still exactly what it was.
+  local rewound = ledger.new({label = "rewound", fleet_size = 1, field_count = 1, window_ticks = 2})
+  ledger.record(rewound, sample(1, {jobs = {
+    {id = 1, generation = 2, operation = "sowing", state = "working",
+      completed_area = 512, total_area = 1024}}}))
+  ledger.record(rewound, sample(2, {jobs = {
+    {id = 1, generation = 2, operation = "sowing", state = "working",
+      completed_area = 256, total_area = 1024}}}))
+  local rewound_report = ledger.summarize(rewound)
+  equal(#rewound_report.violations, 1, "a rewind inside one operation is still a violation")
+  truthy(string.find(rewound_report.violations[1], "coverage rewound"),
+    "the in-operation rewind names itself")
 
   -- ------------------------------------------------------ interval sampling
   --

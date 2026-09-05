@@ -65,6 +65,10 @@ function ledger.new(config)
     -- `job.machine_id`, but the scale ledger must retain which tractor first
     -- accepted the request and how long that dispatch took.
     dispatch_assignments = {},
+    -- Assigned jobs the ledger could not time at all. Counted as well as
+    -- recorded as a violation, so a summary reader sees how much of the
+    -- dispatch latency figure is missing rather than only that something was.
+    dispatch_untimed = 0,
     visuals = {objects_max = 0, objects_total = 0, dirty_field_ticks = 0},
     jobs = {},
     job_state_ticks = {},
@@ -72,19 +76,30 @@ function ledger.new(config)
   }
 end
 
+-- Coverage monotonicity holds *within one operation*, not across a job's whole
+-- life. `slice.start_next_operation` reuses the job id for the field's next
+-- operation and `field.begin_operation` resets `completed_area` to zero, so a
+-- check keyed by job id alone raises a spurious rewind the moment any field
+-- reaches a second operation. The observed phase -- the job's generation plus
+-- its operation name -- is therefore part of the key.
+local function job_phase(job)
+  return tostring(job.generation) .. "/" .. tostring(job.operation)
+end
+
 local function record_job(state, job)
   if type(job) ~= "table" or job.id == nil then return end
   local id = job.id
   local completed = number(job.completed_area, 0)
   local total = number(job.total_area, 0)
+  local phase = job_phase(job)
   local previous = state.jobs[id]
-  if previous and completed < previous.completed_area then
+  if previous and previous.phase == phase and completed < previous.completed_area then
     state.violations[#state.violations + 1] = "coverage rewound for job " .. tostring(id)
   end
   if completed > total then
     state.violations[#state.violations + 1] = "coverage exceeds total for job " .. tostring(id)
   end
-  state.jobs[id] = {completed_area = completed, total_area = total, state = job.state}
+  state.jobs[id] = {completed_area = completed, total_area = total, state = job.state, phase = phase}
   if job.state ~= nil then
     state.job_state_ticks[job.state] = (state.job_state_ticks[job.state] or 0) + 1
   end
@@ -147,11 +162,26 @@ function ledger.record(state, sample)
   for _, job in ipairs(sample.jobs or {}) do
     record_job(state, job)
     if job.id ~= nil and job.machine_id ~= nil and state.dispatch_assignments[job.id] == nil then
-      if type(job.request_tick) ~= "number" then
+      -- Queued fleet jobs are stamped with `request_tick` when they are
+      -- created. The initial player-visible field's job is created by
+      -- `create_field_job` without one and only later given an operation, so
+      -- for that path the ledger measures from `last_operation_tick`, the
+      -- measurement-only stamp `start_next_operation` records. Neither field is
+      -- read by `field.job_precedes`, so which one is used cannot influence
+      -- dispatch order; the row names the source it measured from.
+      local source = "request"
+      local request_tick = job.request_tick
+      if type(request_tick) ~= "number" then
+        source = "operation"
+        request_tick = job.last_operation_tick
+      end
+      if type(request_tick) ~= "number" then
+        state.dispatch_untimed = state.dispatch_untimed + 1
         state.violations[#state.violations + 1] = "assigned job has no request tick: " .. tostring(job.id)
       else
-        state.dispatch_assignments[job.id] = {machine_id = job.machine_id, request_tick = job.request_tick,
-          assigned_tick = tick, latency_ticks = math.max(0, tick - job.request_tick)}
+        state.dispatch_assignments[job.id] = {machine_id = job.machine_id, request_tick = request_tick,
+          request_tick_source = source, assigned_tick = tick,
+          latency_ticks = math.max(0, tick - request_tick)}
       end
     end
   end
@@ -184,13 +214,30 @@ function ledger.summarize(state)
   end
   minimum = minimum or 0
   local samples = state.samples
-  local saturation = samples == 0 and 0 or state.controller_due_total == 0 and 1000 or
-    math.floor(state.controller_updates * 1000 / state.controller_due_total)
+  -- Saturation is served/demanded. With no demand there is no denominator and
+  -- therefore no ratio: reporting 1000 would let a fixture that never activated
+  -- a tractor -- a dead run -- score as "every due tractor was updated". The
+  -- ledger reports no ratio instead, and states separately whether it ever saw
+  -- any demand, so a reader can tell "fully served" from "nothing to serve".
+  local demand_observed = state.controller_due_total > 0
+  local saturation = nil
+  if demand_observed then
+    saturation = math.floor(state.controller_updates * 1000 / state.controller_due_total)
+  end
+  -- A drain window that never closed is dropped from `drain_windows` and
+  -- `drain_ticks_total` by construction, and at scale the longest drain is
+  -- exactly the one most likely to be still open when a run times out. Report
+  -- the open window explicitly so it cannot vanish.
+  local drain_started = state.path.drain_started_tick
+  local drain_open_ticks = 0
+  if drain_started ~= nil and state.last_tick ~= nil then
+    drain_open_ticks = math.max(0, state.last_tick - drain_started)
+  end
   local dispatch_rows = {}
   for job_id, assignment in pairs(state.dispatch_assignments) do
     dispatch_rows[#dispatch_rows + 1] = {job_id = job_id, machine_id = assignment.machine_id,
-      request_tick = assignment.request_tick, assigned_tick = assignment.assigned_tick,
-      latency_ticks = assignment.latency_ticks}
+      request_tick = assignment.request_tick, request_tick_source = assignment.request_tick_source,
+      assigned_tick = assignment.assigned_tick, latency_ticks = assignment.latency_ticks}
   end
   table.sort(dispatch_rows, function(first, second) return first.job_id < second.job_id end)
   local dispatch_total, dispatch_max = 0, 0
@@ -220,7 +267,11 @@ function ledger.summarize(state)
     -- tick, in permille. Both numerator and denominator are sampled the same
     -- way, so the interval scaling cancels and the ratio keeps its per-tick
     -- meaning: 1000 = every due tractor was updated, 500 = half were deferred.
+    -- Absent (nil) when no controller update was ever due, because a ratio with
+    -- no denominator is not a score. `controller_demand_observed` says which
+    -- case a missing ratio is.
     controller_saturation_permille = saturation,
+    controller_demand_observed = demand_observed,
     fairness = {
       machines_served = served,
       machines_unserved = math.max(0, state.fleet_size - served),
@@ -239,9 +290,17 @@ function ledger.summarize(state)
       drain_windows = state.path.drain_windows,
       drain_ticks_total = state.path.drain_ticks_total,
       drain_ticks_max = state.path.drain_ticks_max,
+      -- `drain_ticks_max` and `queue_depth_max` are lower bounds under interval
+      -- sampling: a spike between two samples is invisible, and a window is
+      -- only measured from the samples that bracket it.
+      drain_ticks_max_is_lower_bound = interval > 1,
+      -- Present only when the window ended with a drain still in flight.
+      drain_started_tick = drain_started,
+      drain_open_ticks = drain_open_ticks,
       drain_tick_resolution = interval
     },
-    dispatch = {jobs_assigned = #dispatch_rows, latency_ticks_total = dispatch_total,
+    dispatch = {jobs_assigned = #dispatch_rows, jobs_without_request_tick = state.dispatch_untimed,
+      latency_ticks_total = dispatch_total,
       latency_ticks_max = dispatch_max,
       latency_ticks_mean_permille = #dispatch_rows == 0 and 0 or
         math.floor(dispatch_total * 1000 / #dispatch_rows), jobs = dispatch_rows},
