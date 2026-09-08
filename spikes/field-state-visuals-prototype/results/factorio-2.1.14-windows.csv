@@ -1,0 +1,17 @@
+case_name,state_mode,pattern,field_size,visual_mode,visual_fields,logical_cells,completed_area,range_count,encoded_bytes,state_build_ms,projected_units,projection_ms,projected_save_bytes,projected_load_ms,restored_units,restoration_ms,restoration_passed,restored_save_bytes,restored_load_ms
+ranges-coherent-64,ranges,coherent,64,none,0,4096,4096,64,,0.3082,,,,780381,90.0,,,,
+ranges-coherent-256,ranges,coherent,256,none,0,65536,65536,256,,1.2353,,,,780834,91.0,,,,
+ranges-coherent-1024,ranges,coherent,1024,none,0,1048576,1048576,1024,,5.0554,,,,782530,90.0,,,,
+ranges-fragmented-64,ranges,fragmented,64,none,0,4096,2048,1024,,15.7672,,,,780872,92.0,,,,
+ranges-fragmented-256,ranges,fragmented,256,none,0,65536,32768,16384,,714.8625,,,,799411,91.0,,,,
+ranges-fragmented-1024,ranges,fragmented,1024,none,0,1048576,524288,262144,,41081.0166,,,,1428558,98.0,,,,
+packed-coherent-64,packed,coherent,64,none,0,4096,4096,,512,3.1569,,,,780194,96.0,,,,
+packed-coherent-256,packed,coherent,256,none,0,65536,65536,,8192,50.1291,,,,780429,97.0,,,,
+packed-coherent-1024,packed,coherent,1024,none,0,1048576,1048576,,131072,799.3777,,,,783048,98.0,,,,
+packed-fragmented-64,packed,fragmented,64,none,0,4096,2048,,512,2.8176,,,,780196,98.0,,,,
+packed-fragmented-256,packed,fragmented,256,none,0,65536,32768,,8192,44.6915,,,,780431,96.0,,,,
+packed-fragmented-1024,packed,fragmented,1024,none,0,1048576,524288,,131072,710.1207,,,,783051,106.0,,,,
+tiles-1m,ranges,coherent,1024,tiles,1,1048576,1048576,1024,,5.0572,786432,3815.6536,836945,113.0,786432,1880.7708,true,840853,126.0
+tiles-10m,ranges,coherent,1024,tiles,10,10485760,1048576,1024,,5.1521,7864320,37079.6240,1458862,466.0,7864320,18740.5138,true,1465182,472.0
+render-1m,ranges,coherent,1024,render,1,1048576,1048576,1024,,5.1907,1024,4.5404,880338,118.0,1024,0.7804,true,866527,133.0
+render-10m,ranges,coherent,1024,render,10,10485760,1048576,1024,,5.2376,10240,36.0965,1856294,452.0,10240,11.4142,true,1729230,463.0
