@@ -1,0 +1,9 @@
+{
+  "name": "factorio-farming-vehicle-spike",
+  "version": "0.1.0",
+  "title": "Factorio Farming Vehicle Controller Spike",
+  "author": "Factorio Farming contributors",
+  "description": "PROTOTYPE: headless feasibility harness for asynchronous car pathfinding and lane steering.",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1.0"]
+}
