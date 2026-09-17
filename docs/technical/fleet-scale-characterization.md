@@ -227,17 +227,125 @@ process would be killed mid-write.
 
 ## Results
 
-**No measured result exists yet.** No number below is invented, estimated, or
-carried over from another run; every row is pending a serialized invocation of
-the commands above. When that run completes, its artifact values are copied in
-here. A timeout or integrity failure belongs in this table too, as a
-reproducible miss with its smallest observed bottleneck — a miss is a result,
-not a reason to omit the row.
+Every number below is transcribed from `fleet-scale-ledger.json`, the artifact
+written by the serialized run named under the tables. Nothing here is estimated,
+rounded from a different run, or carried over from the earlier isolated
+vehicle-spike harness. A cell the artifact did not carry reads `not measured`
+rather than a blank, because a blank reads as a zero.
 
-| Fleet | Completion | Active peak | Dispatch max ticks | Path drain max ticks | Script avg/p95/max ms | Effective UPS | Duration | Notes |
-| ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |
-| 2 | Awaiting serialized run | — | — | — | — | — | — | — |
-| 10 | Awaiting serialized run | — | — | — | — | — | — | Includes save/load |
-| 25 | Awaiting serialized run | — | — | — | — | — | — | — |
-| 50 | Awaiting serialized run | — | — | — | — | — | — | Includes save/load |
-| 100 (optional) | Not attempted until the required cases pass | — | — | — | — | — | — | Stretch only |
+**What passed, and what did not.** The production gates — stages 1 to 5, the
+whole required serialized verification — passed. The misses are in the
+characterization block that runs after those gates. These are separate claims
+and this document does not let one stand in for the other: the slice is correct
+at the sizes the gates cover, and it does not complete at 25 or 50.
+
+A miss is a result. It is recorded with its exact reproduction command and the
+smallest bottleneck the run actually observed, and it is not a licence to change
+the controller, the scheduler, or a performance budget. The repair is tracked
+separately; it is deliberately not part of this characterization.
+
+**Gate evidence versus characterization evidence.** A row from a full run has
+the production gates behind it. A row from a targeted re-run (`-ScaleOnly`) does
+not: that mode skips stages 2 to 5 entirely and the artifact marks it
+`scale_only: true`. Such a row is characterization evidence only, and is
+labelled as such rather than mixed in with gate-backed rows.
+
+### The run these numbers come from
+
+    .\tests\run-factorio-tests.ps1 -RunFleetScale -IncludeScale100
+
+Full serialized run on `feature/44-fleet-scale` @ `c098d7c`, Factorio 2.1.14
+(build 87180, win64), 2026-09-17. Stages 1 to 5 — the whole required serialized
+verification — passed. Every failure in that run is in the characterization
+block below, and the artifact is `fleet-scale-ledger.json` with
+`scale_only: false`.
+
+The same four saturation figures were produced by an earlier full run of the
+same commit's parent, so the scaling behaviour below is reproducible rather than
+a single observation.
+
+### Fleet scale
+
+| Fleet | Completion | Controller saturation | Active peak | Dispatch max ticks | Path drain max ticks | Script avg/p95/max ms | Effective UPS | Duration |
+| ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 2 | Exact 2/2 | 100.0% | 2 | 0 | 5 ≥ | 0.0722 / 0.1474 / 0.4970 | 3,333.2 | 11.1 s |
+| 10 | Exact 10/10 | 32.4% | 10 | 0 | 15 ≥ | 0.1023 / 0.1890 / 0.9771 | 3,259.3 | 55.5 s |
+| 25 | **Miss** [^1] — 3072/25600 tiles | 11.5% | 25 | 0 | 30 ≥ | 0.1059 / 0.1614 / 1.9706 | 1,353.7 | 333.2 s |
+| 50 | **Miss** [^2] — 0/51200 tiles | 5.9% | 50 | 0 | 55 ≥ | 0.2013 / 0.3655 / 2.7324 | 878.8 | 1,025.3 s |
+| 100 (optional) | Not attempted | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
+
+`≥` marks a lower bound: a spike between two samples is invisible at the
+declared sampling interval. Controller saturation is the share of observed
+controller demand served on the same observed tick; 100% means every due tractor
+was updated on the tick it came due.
+
+The 100-tractor stretch case was skipped by its own gate, which requires the
+2/10/25/50 cases and both recovery cases to be correct and operational in the
+same run. That gate did its job and the row stays unmeasured rather than
+untested-but-blank.
+
+### Save/load recovery
+
+| Fleet | Result | Save size | Recovered jobs | Recovery observed after | Exact coverage | Stale callback invalidation | Pending-path cleanup |
+| ---: | --- | ---: | ---: | ---: | --- | --- | --- |
+| 10 | Pass | 1.06 MB | 7 | 0 ticks | 10/10 exact | saved request 12 discarded (now 13); generations advanced; proven over 8 live machines | clean, one-request budget held |
+| 50 | **Blocked** [^3] | not measured | not measured | not measured | not measured | not measured | not measured |
+
+The 50-tractor recovery case is **blocked, not merely failed**. The capture needs
+a save containing real working state, and at fifty tractors the fleet completes
+no coverage at all, so there is nothing to capture. It is not that the harness
+could not measure recovery; there was no recovery state to measure. This case
+becomes measurable once the bottleneck below is addressed, and not before.
+Widening the capture window would only produce a save of a fleet doing nothing.
+
+"Recovered jobs: 7" from a ten-tractor fleet is expected, not a shortfall. Only
+machines holding a live, non-completed job at the save are recovered, and only
+those carry a controller callback that recovery must invalidate; the invariant
+was proven over the 8 machines that were live at that instant.
+
+[^1]: production scale 25 tractor scenario timed out waiting for field completion after 450500 ticks. Reproduce with `.\tests\run-factorio-tests.ps1 -ScaleOnly -ScaleCounts 25`.
+[^2]: production scale 50 tractor scenario timed out waiting for field completion after 900500 ticks. Reproduce with `.\tests\run-factorio-tests.ps1 -ScaleOnly -ScaleCounts 50`.
+[^3]: production scale 50 tractor scenario timed out waiting for dispatch capture after 27000 ticks, having completed 0 of 51200 tiles. Reproduce with `.\tests\run-factorio-tests.ps1 -ScaleOnly -ScaleCounts 50`.
+
+## Bottleneck
+
+The smallest observed bottleneck is **controller cadence, not CPU cost**.
+
+At fifty tractors the farming script update averages 0.2013 ms with a p95 of
+0.3655 ms — inside the 0.25 ms average and 0.50 ms p95 budgets — while the fleet
+cultivates nothing whatsoever. The slice is not running out of frame time. No
+budget change would move any number in the table above, which is why the misses
+here are reported rather than answered with a relaxed gate.
+
+What decays is controller saturation: 100% at two tractors, 32.4% at ten, 11.5%
+at twenty-five, 5.9% at fifty — roughly 1/N. The scheduler applies
+`movement.update` to exactly one due machine per tick while the controller runs
+on a 3-tick cadence, so a tractor is steered once every ~N ticks. Steering, the
+speed governor, waypoint arrival (`ARRIVAL_RADIUS = 0.9`) and stuck detection are
+all sampled only on a machine's own update tick, while the vehicle keeps driving
+under a persistent `riding_state`. Past roughly ten tractors a vehicle travels
+several tiles between samples and overshoots its 1–2 tile headland waypoints, so
+alignment never converges. Because the vehicle is still moving, `STUCK_DISTANCE`
+never trips: there is no failure and no recovery, only the deadline.
+
+Dispatch itself is not the limit. Maximum dispatch latency is 0 ticks at every
+scale, and at fifty tractors all fifty jobs were assigned and all fifty machines
+reported active. They were assigned promptly and then starved of control.
+
+This limit was anticipated. `feasibility_v0.1.md` records that if the controller
+spikes failed at the desired active-fleet scale, "the smallest design adjustment
+is to limit simultaneously active machinery through dispatch/path concurrency
+and emphasize higher-capacity equipment". Dispatch/path concurrency is precisely
+what these measurements identify, so this is a confirmed prediction rather than
+an unforeseen defect.
+
+### What this certifies
+
+The slice is certified for **exact completion at up to ten concurrently active
+tractors**, with save/load recovery proven at ten. The ceiling lies between ten
+and twenty-five; this characterization does not locate it more precisely, and no
+claim is made for any fleet larger than ten.
+
+The repair is tracked separately as issue #52, "Dispatch every due tractor
+per tick so the fleet scales past the reference case", and is deliberately
+not part of this characterization.
