@@ -1,21 +1,59 @@
 # Isolated Factorio 2.1 test harness for the production farming slice.
 #
 # Stages:
-#   1. functional  - fresh map, full acceptance flow (headless benchmark)
-#   2. capture     - fresh map driven in real time, saved in each controller
+#   1. pure        - engine-free Lua specs, run before Factorio launches when a
+#                    `lua` interpreter is on PATH (skipped cleanly when not)
+#   2. functional  - fresh map, full acceptance flow (headless benchmark)
+#   3. capture     - fresh map driven in real time, saved in each controller
 #                    phase plus a clean performance reference save
-#   3. saveload    - each controller and crop-operation save is loaded and
+#   4. saveload    - each controller and crop-operation save is loaded and
 #                    driven to exact completion
-#   4. benchmark   - five-minute reference run with the script profiler enabled
+#   5. benchmark   - five-minute reference run with the script profiler enabled
+#
+# Optional fleet scale characterization (issue #44), off by default because it
+# is serialized and takes hours:
+#   -RunFleetScale               run 2/10/25/50 plus the 10/50 recovery cases
+#                                after every stage above has passed
+#   -ScaleOnly                   stage the mods and run ONLY the fleet scale
+#                                block, so a single scale can be reproduced
+#                                without the full suite. Implies -RunFleetScale
+#                                and skips stages 2-5 and their gating.
+#   -ScaleCounts 25              run only the named scales (any of 2/10/25/50/
+#                                100). Recovery runs only for the scales it
+#                                names that have a recovery case (10 and 50).
+#   -IncludeScale100             add the 100-tractor stretch case, only if
+#                                every required case was correct.
 #
 # Everything lives under %LOCALAPPDATA%\FactorioFarmingProductionTests and no
-# personal Factorio mods, saves, or configuration are touched.
+# personal Factorio mods, saves, or configuration are touched. NOTE: the run
+# directory is wiped on every invocation, so a scale run never reuses stale
+# artifacts and -ScaleOnly always re-stages the mods from the working tree.
 
 [CmdletBinding()]
 param(
   [string]$FactorioExe = "D:\SteamLibrary\steamapps\common\Factorio\bin\x64\factorio.exe",
-  [switch]$SkipBenchmark
+  [switch]$SkipBenchmark,
+  [switch]$RunFleetScale,
+  [switch]$ScaleOnly,
+  [int[]]$ScaleCounts,
+  [switch]$IncludeScale100
 )
+
+# The scale block is the only thing -ScaleOnly runs, so it implies -RunFleetScale.
+if ($ScaleOnly) { $RunFleetScale = $true }
+# Scales the mod defines a mode for; see SCALE_SIZES in the test mod control.lua.
+$KnownScaleCounts = @(2, 10, 25, 50, 100)
+$KnownRecoveryCounts = @(10, 50)
+if ($ScaleCounts) {
+  $unknown = $ScaleCounts | Where-Object { $KnownScaleCounts -notcontains $_ }
+  if ($unknown) { throw "Unknown -ScaleCounts value(s): $($unknown -join ', '). Known: $($KnownScaleCounts -join ', ')" }
+  # 100 is the stretch case and is filtered out of the requested set below, so
+  # `-ScaleCounts 100` on its own used to select nothing, run nothing, and exit
+  # 0 with an empty ledger. Refuse it rather than reporting a silent success.
+  if (($ScaleCounts -contains 100) -and (-not $IncludeScale100)) {
+    throw "-ScaleCounts 100 also requires -IncludeScale100: 100 is the opt-in stretch case, and it only runs after the required 2/10/25/50 and both recovery cases are correct."
+  }
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -35,13 +73,64 @@ $P95BudgetMs     = 0.50
 
 $script:Failures = @()
 
+# How long a real-time capture waits after its result JSON appears for the save
+# Factorio is still writing to settle, and how long the save directory must stop
+# changing before the process is stopped. See Invoke-RealtimeCapture.
+$SaveSettleTimeoutSeconds = 180
+$SaveStableSeconds = 2
+
 function Write-Stage($text) { Write-Host ""; Write-Host "=== $text ===" }
 function Write-Pass($text)  { Write-Host "  PASS  $text" }
 function Write-Fail($text)  { Write-Host "  FAIL  $text"; $script:Failures += $text }
 
+# Defined up here rather than beside the benchmark stage so -ScaleOnly, which
+# skips stages 2-5 entirely, can still use it for the scale profile statistics.
+function Get-Percentile($sorted, $fraction) {
+  if ($sorted.Count -eq 0) { return 0 }
+  $index = [Math]::Ceiling($fraction * $sorted.Count) - 1
+  if ($index -lt 0) { $index = 0 }
+  if ($index -ge $sorted.Count) { $index = $sorted.Count - 1 }
+  return $sorted[$index]
+}
+
 if (-not (Test-Path $FactorioExe)) {
   Write-Host "Factorio was not found at $FactorioExe"
   exit 1
+}
+
+# --------------------------------------------------------- stage 1: pure Lua
+#
+# The engine-free specs behind the scale characterization (the ledger
+# arithmetic and the fixture geometry invariant) run without booting the game,
+# so they run first: a broken invariant should not cost an hour of serialized
+# Factorio time to discover. The Factorio test mod runs the same spec file
+# during its on_init pure-test pass, so this is a fast pre-flight, not a
+# second source of truth. Lua is not a dependency of this harness; when no
+# interpreter is present the stage says so and the run continues.
+
+Write-Stage "Stage 1/5  engine-free Lua specs"
+$PureRunner = Join-Path $PSScriptRoot "pure\run-pure-lua.lua"
+$LuaExe = $null
+foreach ($candidate in @("lua", "lua54", "lua5.4", "lua53", "lua5.3", "lua52", "lua5.2", "luajit")) {
+  $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($found) { $LuaExe = $found.Source; break }
+}
+if (-not (Test-Path $PureRunner)) {
+  Write-Fail "pure Lua specs (runner missing at $PureRunner)"
+} elseif (-not $LuaExe) {
+  Write-Host "  skipped: no lua interpreter on PATH (tried lua, lua54, lua5.4, lua53, lua5.3, lua52, lua5.2, luajit)"
+  Write-Host "  the same specs still run inside Factorio during the test mod's on_init pure-test pass"
+} else {
+  Push-Location $RepoRoot
+  try {
+    $pureOutput = & $LuaExe $PureRunner
+    $pureExit = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  $pureOutput | ForEach-Object { Write-Host "  $_" }
+  if ($pureExit -eq 0) { Write-Pass "engine-free Lua specs ($LuaExe)" }
+  else { Write-Fail "engine-free Lua specs ($LuaExe, exit $pureExit)" }
 }
 
 # ------------------------------------------------------------------ staging
@@ -130,7 +219,29 @@ function Invoke-RealtimeCapture($stage, [int]$deadlineMinutes) {
     if ($proc.HasExited) { break }
     Start-Sleep -Milliseconds 500
   }
-  Start-Sleep -Seconds 2
+  # The mod calls game.auto_save BEFORE it writes its result JSON, so when the
+  # poll above sees the JSON the save is still streaming to disk. A fixed sleep
+  # was enough for the small acceptance maps but not for a 50-tractor fixture on
+  # a 1696 x 416 surface: killing the process mid-write leaves a truncated or
+  # missing zip and the recovery case fails for a reason that is not the code
+  # under test. Wait until every save file has stopped changing instead, bounded
+  # so a run that writes no save at all does not stall the harness.
+  $settleDeadline = (Get-Date).AddSeconds($SaveSettleTimeoutSeconds)
+  $previousSignature = $null
+  $stableSince = $null
+  while ((Get-Date) -lt $settleDeadline) {
+    $signature = (@(Get-ChildItem -LiteralPath $SavesRoot -Filter "*.zip" -ErrorAction SilentlyContinue |
+      Sort-Object Name | ForEach-Object { "$($_.Name):$($_.Length)" }) -join "|")
+    if ($null -ne $previousSignature -and $signature -eq $previousSignature) {
+      if ($null -eq $stableSince) { $stableSince = Get-Date }
+      if (((Get-Date) - $stableSince).TotalSeconds -ge $SaveStableSeconds) { break }
+    } else {
+      $stableSince = $null
+    }
+    $previousSignature = $signature
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 500
+  }
   if (-not $proc.HasExited) { try { Stop-Process -Id $proc.Id -Force } catch {} }
   Start-Sleep -Seconds 1
   Save-StageLog $stage | Out-Null
@@ -138,8 +249,13 @@ function Invoke-RealtimeCapture($stage, [int]$deadlineMinutes) {
 }
 
 # --------------------------------------------------------------- functional
+#
+# Stages 2-5 are the production gates. -ScaleOnly skips all of them so a single
+# fleet scale can be reproduced on its own; the body is deliberately left at its
+# original indentation so this stays a two-line change rather than a reflow.
+if (-not $ScaleOnly) {
 
-Write-Stage "Stage 1/4  functional acceptance flow"
+Write-Stage "Stage 2/5  functional acceptance flow"
 Set-TestMode "functional"
 $functionalSave = Join-Path $RunRoot "slice-test.zip"
 Invoke-Factorio "functional-create" @("--create", $functionalSave) | Out-Null
@@ -331,7 +447,7 @@ if (-not $playerMultifieldCaptureOutcome.SaveCreated) {
 
 # ------------------------------------------------------------------ capture
 
-Write-Stage "Stage 2/4  capture a save in every controller phase"
+Write-Stage "Stage 3/5  capture a save in every controller phase"
 $capturedPhases = @()
 $captureOutcome = Invoke-RealtimeCapture "capture" 6
 $capture = $captureOutcome.Result
@@ -347,7 +463,7 @@ if (-not $captureOutcome.SaveCreated) {
 
 # ----------------------------------------------------------------- saveload
 
-Write-Stage "Stage 3/4  load each phase save and drive it to completion"
+Write-Stage "Stage 4/5  load each phase save and drive it to completion"
 Set-TestMode "replay"
 foreach ($phase in @("reserved", "travelling", "working", "paused")) {
   if ($capturedPhases -notcontains $phase) { Write-Fail "save/load $phase (no save captured)"; continue }
@@ -424,15 +540,7 @@ Set-TestMode "replay"
 
 # ---------------------------------------------------------------- benchmark
 
-function Get-Percentile($sorted, $fraction) {
-  if ($sorted.Count -eq 0) { return 0 }
-  $index = [Math]::Ceiling($fraction * $sorted.Count) - 1
-  if ($index -lt 0) { $index = 0 }
-  if ($index -ge $sorted.Count) { $index = $sorted.Count - 1 }
-  return $sorted[$index]
-}
-
-Write-Stage "Stage 4/4  five-minute performance reference run"
+Write-Stage "Stage 5/5  five-minute performance reference run"
 if ($SkipBenchmark) {
   Write-Host "  skipped by request"
 } elseif ($capturedPhases -notcontains "benchmark") {
@@ -501,11 +609,226 @@ if ($SkipBenchmark) {
   }
 }
 
+} else {
+  Write-Stage "Stages 2-5 skipped (-ScaleOnly)"
+  Write-Host "  the production gates were not run, so the scale block below is not gated on them"
+}
+
+# ----------------------------------------------------- fleet scale evidence
+
+function Get-FarmingProfileStatistics($logPath) {
+  $samples = New-Object System.Collections.Generic.List[double]
+  if (Test-Path $logPath) {
+    foreach ($line in [System.IO.File]::ReadLines($logPath)) {
+      if ($line -match 'FARMING_PROFILE (\d+) (\d+) Duration: ([0-9.]+)ms') {
+        $samples.Add([double]$Matches[3])
+      }
+    }
+  }
+  if ($samples.Count -eq 0) { return $null }
+  $sorted = $samples | Sort-Object
+  return [pscustomobject]@{
+    samples = $samples.Count
+    average_ms = [Math]::Round(($samples | Measure-Object -Average).Average, 6)
+    p95_ms = [Math]::Round((Get-Percentile $sorted 0.95), 6)
+    max_ms = [Math]::Round($sorted[$sorted.Count - 1], 6)
+  }
+}
+
+function Invoke-FleetScaleBenchmark([int]$count) {
+  $stage = "scale-$count"
+  Set-TestMode $stage
+  # The controller applies one due tractor update per tick. The allowance is a
+  # deterministic timeout, not a target performance budget; a miss is written
+  # to the ledger as evidence rather than relaxed here.
+  $ticks = ($count * 18000) + 1000
+  $save = Join-Path $RunRoot "$stage.zip"
+  Invoke-Factorio "$stage-create" @("--create", $save) | Out-Null
+  if (-not (Test-Path $save)) {
+    Write-Fail "$stage map creation"
+    return $null
+  }
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Invoke-Factorio $stage @("--benchmark", $save, "--benchmark-ticks", "$ticks", "--benchmark-runs", "1") | Out-Null
+  $timer.Stop()
+  $result = Get-Result $stage
+  $profile = Get-FarmingProfileStatistics (Join-Path $LogRoot "$stage.log")
+  $durationSeconds = [Math]::Round($timer.Elapsed.TotalSeconds, 3)
+  $effectiveUps = if ($timer.Elapsed.TotalSeconds -gt 0) {
+    [Math]::Round($ticks / $timer.Elapsed.TotalSeconds, 3)
+  } else { 0 }
+  # A miss is evidence. Every attempted scale returns a report, carrying the
+  # ledger the mod wrote before it errored, so the artifact records what was
+  # measured rather than silently dropping the scale that failed.
+  if (-not $result -or -not $result.passed -or -not $profile) {
+    $reason = if (-not $result) { "the run wrote no result JSON (crash, or a deadline outside the benchmark window)" }
+      elseif (-not $result.passed) { if ($result.reason) { $result.reason } else { "the run reported passed=false with no reason" } }
+      else { "the run produced no FARMING_PROFILE samples" }
+    Write-Fail "$stage production characterization: $reason"
+    Show-ScriptError $stage
+    return [pscustomobject]@{
+      count = $count
+      passed = $false
+      reason = $reason
+      completion = $result
+      script_update = $profile
+      benchmark_ticks = $ticks
+      test_duration_seconds = $durationSeconds
+      effective_ups = $effectiveUps
+    }
+  }
+  $report = [pscustomobject]@{
+    count = $count
+    passed = $true
+    reason = $null
+    completion = $result
+    script_update = $profile
+    benchmark_ticks = $ticks
+    test_duration_seconds = $durationSeconds
+    effective_ups = $effectiveUps
+  }
+  # Printed from the measured ledger, never from the requested count: a pass
+  # line formatted from what was asked for cannot fail.
+  $exactJobs = $result.ledger.coverage.exact_jobs
+  $trackedJobs = $result.ledger.coverage.tracked_jobs
+  Write-Pass ("scale {0}: exact {1}/{2} fields (of {0} requested), avg {3:N4} ms p95 {4:N4} ms max {5:N4} ms, {6:N1} effective UPS, sampled every {7} ticks" -f `
+    $count, $exactJobs, $trackedJobs, $profile.average_ms, $profile.p95_ms, $profile.max_ms, $effectiveUps,
+    $result.ledger.sample_interval_ticks)
+  if ($exactJobs -ne $count -or $trackedJobs -ne $count) {
+    Write-Fail "$stage coverage: the ledger measured $exactJobs exact of $trackedJobs tracked fields, not $count of $count"
+    $report.passed = $false
+    $report.reason = "measured coverage did not match the requested fleet size"
+  }
+  return $report
+}
+
+function Invoke-FleetScaleRecovery([int]$count) {
+  $captureStage = "scale-$count-capture"
+  $capture = Invoke-RealtimeCapture $captureStage 8
+  $captureResult = $capture.Result
+  $save = Get-ChildItem -LiteralPath $SavesRoot -Filter "*scale-$count-working.zip" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $capture.SaveCreated -or -not $captureResult -or -not $captureResult.passed -or -not $save) {
+    $reason = if (-not $capture.SaveCreated) { "the capture map was never created" }
+      elseif (-not $captureResult) { "the real-time capture wrote no result JSON before the harness stopped it" }
+      elseif (-not $captureResult.passed) { if ($captureResult.reason) { $captureResult.reason } else { "the capture reported passed=false with no reason" } }
+      else { "the capture produced no save file" }
+    Write-Fail "scale $count save/load capture: $reason"
+    Show-ScriptError $captureStage
+    return [pscustomobject]@{count = $count; passed = $false; reason = $reason; save_bytes = $null
+      capture = $captureResult; replay = $null}
+  }
+  $saveBytes = $save.Length
+  $replayStage = "scale-$count-replay"
+  Set-TestMode $replayStage
+  $ticks = ($count * 18000) + 1000
+  Invoke-Factorio $replayStage @("--benchmark", $save.FullName, "--benchmark-ticks", "$ticks", "--benchmark-runs", "1") | Out-Null
+  $replay = Get-Result $replayStage
+  # `lazy_recovery_initialization` and `pending_path_cleaned` are observations
+  # `lazy_recovery_initialization` and `pending_path_cleaned` are observations
+  # the replay made on the tick the load became observable, not literals it
+  # wrote, so gating on them is a real gate. `pending_path_cleaned` means the
+  # SAVED path request id was discarded, the one-outstanding-request budget
+  # still held, and every recovered controller generation advanced -- not that
+  # no request exists, because recovery legitimately reissues one immediately.
+  # See drive_scale_replay in the test mod.
+  if (-not $replay -or -not $replay.passed -or -not $replay.lazy_recovery_initialization -or
+      -not $replay.pending_path_cleaned) {
+    $reason = if (-not $replay) { "the replay wrote no result JSON" }
+      elseif (-not $replay.passed) { if ($replay.reason) { $replay.reason } else { "the replay reported passed=false with no reason" } }
+      elseif (-not $replay.lazy_recovery_initialization) { "the loaded session did not observe lazy recovery initialization" }
+      elseif (-not $replay.pending_path_invalidated) { "the loaded session still held the path request id that was saved ($($replay.saved_pending_path_id))" }
+      elseif (-not $replay.pending_path_budget_held) { "the loaded session exceeded the one-outstanding-path-request budget" }
+      else { "the loaded session did not advance every recovered controller generation" }
+    Write-Fail "scale $count save/load replay: $reason"
+    Show-ScriptError $replayStage
+    return [pscustomobject]@{count = $count; passed = $false; reason = $reason; save_bytes = $saveBytes
+      capture = $captureResult; replay = $replay}
+  }
+  Write-Pass ("scale {0} save/load: {1} MB save, stale controllers invalidated, {2} recovered jobs observed after {3} ticks, exact coverage resumed, saved path request {4} discarded" -f `
+    $count, [Math]::Round($saveBytes / 1MB, 2), $replay.recovered_jobs_observed,
+    $replay.recovery_observed_after_ticks, $replay.saved_pending_path_id)
+  return [pscustomobject]@{count = $count; passed = $true; reason = $null; save_bytes = $saveBytes
+    capture = $captureResult; replay = $replay}
+}
+
+# -ScaleOnly did not run the production gates, so there is nothing to gate on;
+# a normal run still refuses to characterize a slice whose gates are red.
+$scaleGateOpen = $ScaleOnly -or ($script:Failures.Count -eq 0)
+if ($RunFleetScale -and $scaleGateOpen) {
+  Write-Stage "Fleet scale characterization (serialized)"
+  # Default characterization set. -ScaleCounts narrows it so one scale can be
+  # re-run on its own; 100 stays opt-in through -IncludeScale100.
+  $requestedCounts = if ($ScaleCounts) { @($ScaleCounts | Where-Object { $_ -ne 100 } | Sort-Object -Unique) }
+                     else { @(2, 10, 25, 50) }
+  $requestedRecovery = @($KnownRecoveryCounts | Where-Object {
+    (-not $ScaleCounts) -or ($ScaleCounts -contains $_)
+  })
+  $requiredCounts = @(2, 10, 25, 50)
+  $stretchRequested = [bool]($IncludeScale100 -or ($ScaleCounts -contains 100))
+  $announced = @($requestedCounts)
+  if ($stretchRequested) { $announced += 100 }
+  Write-Host ("  scales: {0}" -f $(if ($announced.Count) { $announced -join ', ' } else { "none" }))
+  Write-Host ("  save/load recovery: {0}" -f $(if ($requestedRecovery.Count) { $requestedRecovery -join ', ' } else { "none" }))
+  # A characterization that characterizes nothing is a failure, not a pass. The
+  # stretch case does not count here: it may legitimately be skipped by its own
+  # gate below, and something must actually have been measured either way.
+  if ($requestedCounts.Count -eq 0 -and $requestedRecovery.Count -eq 0) {
+    Write-Fail "fleet scale characterization selected no scale to run (requested: $($ScaleCounts -join ', '))"
+  }
+  $failuresBefore = $script:Failures.Count
+  $scaleResults = @()
+  foreach ($count in $requestedCounts) {
+    # Every attempted scale is folded into the artifact, pass or miss.
+    $scaleResults += Invoke-FleetScaleBenchmark $count
+  }
+  $scaleRecovery = @()
+  foreach ($count in $requestedRecovery) {
+    $scaleRecovery += Invoke-FleetScaleRecovery $count
+  }
+  $requiredPassed = @($scaleResults | Where-Object { $_.passed -and ($requiredCounts -contains $_.count) }).Count
+  $recoveryPassed = @($scaleRecovery | Where-Object { $_.passed }).Count
+  if ($stretchRequested -and $requiredPassed -eq $requiredCounts.Count -and $recoveryPassed -eq $KnownRecoveryCounts.Count) {
+    $scaleResults += Invoke-FleetScaleBenchmark 100
+  } elseif ($stretchRequested) {
+    Write-Host "  scale 100 skipped: the required 2/10/25/50 cases and both recovery cases were not all correct and operational in this run"
+  }
+  # Nothing ran at all: an empty ledger artifact must not read as success.
+  if ($scaleResults.Count -eq 0 -and $scaleRecovery.Count -eq 0) {
+    Write-Fail "fleet scale characterization executed zero scales, so the ledger artifact is empty"
+  }
+  # The artifact must make a miss visible, so it records what was attempted,
+  # what passed, and what did not, not just the scales that succeeded.
+  [pscustomobject]@{
+    scale_only = [bool]$ScaleOnly
+    attempted_scales = $requestedCounts
+    attempted_recovery = $requestedRecovery
+    stretch_requested = [bool]$stretchRequested
+    scales_attempted = $scaleResults.Count
+    scales_passed = @($scaleResults | Where-Object { $_.passed }).Count
+    scales_failed = @($scaleResults | Where-Object { -not $_.passed }).Count
+    recovery_attempted = $scaleRecovery.Count
+    recovery_passed = $recoveryPassed
+    recovery_failed = @($scaleRecovery | Where-Object { -not $_.passed }).Count
+    new_failures = $script:Failures.Count - $failuresBefore
+    scales = $scaleResults
+    recovery = $scaleRecovery
+  } | ConvertTo-Json -Depth 16 | Out-File -FilePath (Join-Path $OutputRoot "fleet-scale-ledger.json") -Encoding ascii
+  Write-Host "  ledger artifact: $(Join-Path $OutputRoot 'fleet-scale-ledger.json')"
+} elseif ($RunFleetScale) {
+  Write-Host "  fleet scale characterization skipped because an existing production gate failed"
+  Write-Host "  re-run a single scale on its own with: -ScaleOnly -ScaleCounts <n>"
+}
+
 # ------------------------------------------------------------------ summary
 
 Write-Stage "Summary"
 if ($script:Failures.Count -eq 0) {
-  Write-Host "  All Factorio production slice gates passed."
+  if ($ScaleOnly) {
+    Write-Host "  Fleet scale characterization completed. Stages 2-5 were NOT run (-ScaleOnly)."
+  } else {
+    Write-Host "  All Factorio production slice gates passed."
+  }
   Write-Host "  Artifacts: $OutputRoot"
   exit 0
 }

@@ -6,6 +6,11 @@ local slice = {}
 local load_recovery_needed = false
 local recovered_job_areas = nil
 local profile = nil
+-- Ephemeral observations for the production scale harness. Field, job, and
+-- machine records remain authoritative; this only reports the last scheduler
+-- tick and is never used to resume work after a load.
+local last_tick_telemetry = {controller_due = 0, controller_updated_machine_id = nil,
+  path_queue_depth = 0, outstanding_paths = 0}
 local start_lane
 local complete_job
 local finish_lane
@@ -494,6 +499,8 @@ end
 
 function slice.on_load()
   load_recovery_needed = true
+  last_tick_telemetry = {controller_due = 0, controller_updated_machine_id = nil,
+    path_queue_depth = 0, outstanding_paths = 0}
 end
 
 -- Path requests never survive a save. Every in-flight request is dropped and the
@@ -854,6 +861,15 @@ start_next_operation = function(state, player)
   job.implement = operation_name
   job.state = "waiting"
   job.failure = nil
+  -- Measurement only, and deliberately NOT `request_tick`. `request_tick` is
+  -- the scheduler's equal-priority tie-break (`field.job_precedes`), so
+  -- re-stamping it here would make a restarted field lose ties it used to win.
+  -- The initial player-visible field's job is created by `create_field_job`
+  -- without a `request_tick` at all, so the scale ledger has nothing to measure
+  -- its dispatch latency from; this separate stamp gives it one.
+  -- `field.job_precedes` reads only `priority`, `request_tick` and `id`, so
+  -- nothing in the scheduler consults this field.
+  job.last_operation_tick = game.tick
   job.generation = job.generation + 1
   job.player_index = player and player.index or job.player_index
   local surface = state.surface or surface_state(state.field.surface_index)
@@ -1044,6 +1060,12 @@ local function tick_body(event)
   dispatch_queued_jobs(root)
   promote_reserved(root)
   movement.process_path_queue(event.tick)
+  -- Measurement only: sample the queue after it has been processed so the
+  -- telemetry published at the end of this tick describes the tick it is
+  -- labelled with. Sampling before the queue ran published a one-tick-stale
+  -- depth, which shifted every observed drain window by a tick.
+  local queued_paths_now = #root.path_queue
+  local outstanding_now = root.outstanding_path_id and 1 or 0
   local due = {}
   local active = 0
   for _, work_field in pairs(root.fields) do
@@ -1062,6 +1084,7 @@ local function tick_body(event)
     end
   end
   table.sort(due, function(a, b) return a.machine.id < b.machine.id end)
+  local updated_machine_id = nil
   if #due > 0 then
     local selected = due[1]
     for _, candidate in ipairs(due) do
@@ -1071,6 +1094,7 @@ local function tick_body(event)
       end
     end
     root.last_controller_machine_id = selected.machine.id
+    updated_machine_id = selected.machine.id
     handle_outcome(selected, movement.update(selected.machine, event.tick))
     finish_arrived_harvest_lane(selected)
   end
@@ -1079,6 +1103,8 @@ local function tick_body(event)
     if state then finish_arrived_harvest_lane(state) end
   end
   visuals.update()
+  last_tick_telemetry = {controller_due = #due, controller_updated_machine_id = updated_machine_id,
+    path_queue_depth = queued_paths_now, outstanding_paths = outstanding_now}
   return active
 end
 
@@ -1263,7 +1289,51 @@ function slice.snapshot(surface_index)
   local job = state.job
   local machine = state.machine
   local storage_inventory = work_field and destination_inventory(state)
+  local all_jobs = {}
+  local owned_machine_count = 0
+  local active_machine_count = 0
+  local visual_object_count = 0
+  local dirty_field_count = 0
+  for _, fleet_machine in pairs(root.machines) do
+    if fleet_machine.surface_index == surface_index then
+      if movement.entity(fleet_machine) then owned_machine_count = owned_machine_count + 1 end
+      local fleet_job = fleet_machine.job_id and root.jobs[fleet_machine.job_id]
+      if fleet_job and fleet_job.state ~= "paused" and fleet_job.state ~= "failed" and
+         fleet_job.state ~= "completed" then active_machine_count = active_machine_count + 1 end
+      local overlay = visuals.machine_overlay(fleet_machine.id)
+      visual_object_count = visual_object_count + (overlay and overlay.object_count or 0)
+    end
+  end
+  for _, live in pairs(root.fields) do
+    if live.surface_index == surface_index and not live.migration_failed then
+      visual_object_count = visual_object_count + visuals.object_count(live.id)
+      if visuals.is_dirty(live.id) then dirty_field_count = dirty_field_count + 1 end
+    end
+  end
+  for _, live_job in pairs(root.jobs) do
+    local live_field = root.fields[live_job.field_id]
+    if live_field and live_field.surface_index == surface_index then
+      all_jobs[#all_jobs + 1] = {id = live_job.id, field_id = live_job.field_id, state = live_job.state,
+        operation = live_job.operation, machine_id = live_job.machine_id, priority = live_job.priority,
+        request_tick = live_job.request_tick, last_operation_tick = live_job.last_operation_tick,
+        generation = live_job.generation, failure = live_job.failure,
+        completed_area = live_field.completed_area, total_area = live_field.area,
+        cultivated_area = field_module.operation_area(live_field, "cultivation"),
+        sown_area = field_module.operation_area(live_field, "sowing"),
+        harvested_area = field_module.operation_area(live_field, "harvesting"), crop_count = #live_field.crops}
+    end
+  end
+  table.sort(all_jobs, function(a, b) return a.id < b.id end)
   return {
+    tick = game.tick,
+    fleet = {owned = owned_machine_count, active = active_machine_count},
+    controller_due = last_tick_telemetry.controller_due,
+    controller_updated_machine_id = last_tick_telemetry.controller_updated_machine_id,
+    path_queue_depth = last_tick_telemetry.path_queue_depth,
+    outstanding_paths = last_tick_telemetry.outstanding_paths,
+    visual_objects = visual_object_count,
+    dirty_fields = dirty_field_count,
+    jobs = all_jobs,
     field = work_field and {
       id = work_field.id,
       completed_area = work_field.completed_area,
@@ -1333,6 +1403,10 @@ function slice.snapshot(surface_index)
       return result
     end)(),
     pending_path_count = ensure_root().outstanding_path_id and 1 or 0,
+    -- The engine's own request id, published so a load can be checked for
+    -- having discarded the *saved* request rather than merely for having no
+    -- request at all. Measurement only; nothing reads it back.
+    pending_path_id = ensure_root().outstanding_path_id,
     visual_count = work_field and visuals.object_count(work_field.id) or 0,
     -- Every live field on the surface reports its own projection, so selected
     -- and non-selected fields are observable apart from each other.
