@@ -910,18 +910,24 @@ local function capture_scale_recovery(run, snap)
   -- follows, rather than by scanning jobs for a matching `machine_id`: the two
   -- sides agree today, and if they ever stop agreeing this must track whatever
   -- production would act on.
+  -- `machine.valid` mirrors the other half of the production condition: the
+  -- bump sits inside `if movement.entity(machine)`, and a machine whose entity
+  -- is gone is failed rather than bumped. Recording one would reintroduce the
+  -- same false failure from the other direction.
   captured.generations_tracked = 0
   for _, machine in ipairs(snap.machines or {}) do
     local held = machine.job_id and scale_job(snap, machine.job_id)
-    if held and held.state ~= "completed" then
+    if machine.valid and held and held.state ~= "completed" then
       captured.generations[machine.id] = machine.generation
       captured.generations_tracked = captured.generations_tracked + 1
     end
   end
-  -- A capture that tracks no machine proves nothing about stale-callback
-  -- invalidation, so it is a failure rather than a vacuous pass.
-  truthy(captured.generations_tracked > 0,
-    "scale capture recorded no live machine, so the replay could not prove stale-callback invalidation")
+  -- A capture that tracks almost nothing proves almost nothing, so the floor is
+  -- a majority of the fleet rather than one machine: a regression that left a
+  -- single machine live would otherwise still pass while publishing tracked=1.
+  truthy(captured.generations_tracked * 2 >= run.count,
+    "scale capture tracked only " .. tostring(captured.generations_tracked) .. " live machines of " ..
+    tostring(run.count) .. ", too few to prove stale-callback invalidation")
   storage.scale_recovery = captured
   game.auto_save("scale-" .. tostring(run.count) .. "-working")
   write_result("scale-" .. tostring(run.count) .. "-capture", {passed = true, count = run.count,
@@ -1112,13 +1118,22 @@ local function drive_scale_replay(event)
     -- over. `controller_generations_tracked` publishes the size of that set so
     -- a pass cannot be read as stronger than what it proved.
     local generations_advanced = true
+    local generations_matched = 0
     for _, machine in ipairs(snap.machines or {}) do
       local generation = saved.generations[machine.id]
+      if generation ~= nil then generations_matched = generations_matched + 1 end
       if not (generation == nil or machine.generation > generation) then generations_advanced = false end
       truthy(generation == nil or machine.generation > generation,
         "scale replay trusted a stale controller callback for tractor " .. tostring(machine.id))
     end
+    -- Skipping a machine with no saved generation is correct, but it also means
+    -- a machine that the capture tracked and the load then DROPPED would be
+    -- skipped silently. The tracked count exists precisely so that cannot
+    -- happen: every machine the capture proved live must still be here.
+    equal(generations_matched, saved.generations_tracked,
+      "scale replay did not observe every machine the capture tracked")
     replay.generations_advanced = generations_advanced
+    replay.generations_matched = generations_matched
 
     -- Pending-path cleanup. The invariant is that the SAVED request was
     -- discarded, not that no request exists: `recover_loaded_state` clears the
