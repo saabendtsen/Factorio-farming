@@ -5,11 +5,10 @@ two-tractor acceptance case. It is deliberately evidence-oriented: an observed
 miss records the exact scenario and bottleneck without changing a performance
 budget or claiming a supported fleet limit.
 
-> **Status: a measurement design, not a measured result.** Nothing here is a
-> delivered fleet-size claim. The results table at the end of this document is
-> a shape waiting to be filled in from a serialized run; every row is still
-> pending, and no scale beyond the two-tractor acceptance case currently has a
-> recorded passing measurement.
+> **Status: measured.** The results below come from a full serialized run of
+> `d88943b` on 2026-09-18, reproduced across three independent runs. Exact
+> completion and save/load recovery hold at ten concurrently active tractors;
+> twenty-five and fifty miss, and no claim is made beyond ten.
 
 ## Scenario boundary
 
@@ -254,30 +253,33 @@ labelled as such rather than mixed in with gate-backed rows.
 
     .\tests\run-factorio-tests.ps1 -RunFleetScale -IncludeScale100
 
-Full serialized run on `feature/44-fleet-scale` @ `c098d7c`, Factorio 2.1.14
-(build 87180, win64), 2026-09-17. Stages 1 to 5 — the whole required serialized
+Full serialized run on `feature/44-fleet-scale` @ `d88943b`, Factorio 2.1.14
+(build 87180, win64), 2026-09-18. Stages 1 to 5 — the whole required serialized
 verification — passed. Every failure in that run is in the characterization
 block below, and the artifact is `fleet-scale-ledger.json` with
 `scale_only: false`.
 
-The same four saturation figures were produced by an earlier full run of the
-same commit's parent, so the scaling behaviour below is reproducible rather than
-a single observation.
+Three independent full runs produced identical controller saturation and
+identical service spread at every scale, so the scaling behaviour below is
+reproducible rather than a single observation. Only wall-clock figures — script
+timings, effective UPS, duration, save size — vary between runs.
 
 ### Fleet scale
 
-| Fleet | Completion | Controller saturation | Active peak | Dispatch max ticks | Path drain max ticks | Script avg/p95/max ms | Effective UPS | Duration |
-| ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| 2 | Exact 2/2 | 100.0% | 2 | 0 | 5 ≥ | 0.0722 / 0.1474 / 0.4970 | 3,333.2 | 11.1 s |
-| 10 | Exact 10/10 | 32.4% | 10 | 0 | 15 ≥ | 0.1023 / 0.1890 / 0.9771 | 3,259.3 | 55.5 s |
-| 25 | **Miss** [^1] — 3072/25600 tiles | 11.5% | 25 | 0 | 30 ≥ | 0.1059 / 0.1614 / 1.9706 | 1,353.7 | 333.2 s |
-| 50 | **Miss** [^2] — 0/51200 tiles | 5.9% | 50 | 0 | 55 ≥ | 0.2013 / 0.3655 / 2.7324 | 878.8 | 1,025.3 s |
-| 100 (optional) | Not attempted | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
+| Fleet | Completion | Controller saturation | Service spread | Active peak | Dispatch max ticks | Path drain max ticks | Script avg/p95/max ms | Effective UPS | Duration |
+| ---: | --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: |
+| 2 | Exact 2/2 | 100.0% | 0 unserved; 1,245–1,250 updates | 2 | 0 | 5 ≥ | 0.0677 / 0.1331 / 0.4444 | 3,335.6 | 11.1 s |
+| 10 | Exact 10/10 | 32.4% | 0 unserved; 845–1,255 updates | 10 | 0 | 15 ≥ | 0.1007 / 0.1788 / 0.6404 | 3,329.6 | 54.4 s |
+| 25 | **Miss** [^1] — 3072/25600 tiles | 11.5% | 10 unserved; 0–37,545 updates | 25 | 0 | 30 ≥ | 0.1006 / 0.1414 / 1.1147 | 1,444.7 | 312.2 s |
+| 50 | **Miss** [^2] — 0/51200 tiles | 5.9% | 0 unserved; 425–37,045 updates | 50 | 0 | 55 ≥ | 0.1962 / 0.3482 / 1.8226 | 918.0 | 981.4 s |
+| 100 (optional) | Not attempted | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
 
 `≥` marks a lower bound: a spike between two samples is invisible at the
 declared sampling interval. Controller saturation is the share of observed
 controller demand served on the same observed tick; 100% means every due tractor
-was updated on the tick it came due.
+was updated on the tick it came due. Service spread reports how that service was
+distributed across the fleet: how many machines received no update at all, and
+the range from the least- to the most-served machine.
 
 The 100-tractor stretch case was skipped by its own gate, which requires the
 2/10/25/50 cases and both recovery cases to be correct and operational in the
@@ -288,20 +290,34 @@ untested-but-blank.
 
 | Fleet | Result | Save size | Recovered jobs | Recovery observed after | Exact coverage | Stale callback invalidation | Pending-path cleanup |
 | ---: | --- | ---: | ---: | ---: | --- | --- | --- |
-| 10 | Pass | 1.06 MB | 7 | 0 ticks | 10/10 exact | saved request 12 discarded (now 13); generations advanced; proven over 8 live machines | clean, one-request budget held |
+| 10 | Pass | 0.92 MB | 7 | 0 ticks | 10/10 exact | saved request 12 discarded (now 13); generations advanced; proven over 8 live machines | clean, one-request budget held |
 | 50 | **Blocked** [^3] | not measured | not measured | not measured | not measured | not measured | not measured |
 
-The 50-tractor recovery case is **blocked, not merely failed**. The capture needs
-a save containing real working state, and at fifty tractors the fleet completes
-no coverage at all, so there is nothing to capture. It is not that the harness
-could not measure recovery; there was no recovery state to measure. This case
-becomes measurable once the bottleneck below is addressed, and not before.
-Widening the capture window would only produce a save of a fleet doing nothing.
+`recovered_jobs` counts the jobs visible in the snapshot's queued-job list that
+carry a recovered coverage value. It is a visibility count, not the size of the
+recovered set: the queued list excludes the currently selected field's job. The
+number of machines over which stale-callback invalidation was actually proven is
+`controller_generations_tracked`, which is 8 here.
 
-"Recovered jobs: 7" from a ten-tractor fleet is expected, not a shortfall. Only
-machines holding a live, non-completed job at the save are recovered, and only
-those carry a controller callback that recovery must invalidate; the invariant
-was proven over the 8 machines that were live at that instant.
+**Why the 50-tractor case is blocked rather than failed.** The capture requires a
+save that contains an outstanding engine path request — otherwise the replay
+cannot prove the *saved* request was discarded, which is the actual invariant —
+and at least one field that has advanced. At fifty tractors neither holds: at the
+capture deadline all fifty machines are valid and all fifty jobs are `working`,
+but every controller is still in `positioning` with zero coverage completed, and
+a fresh path request only issues on a lane transition, which requires coverage.
+Path requests were outstanding for just 52 of 27,001 observed ticks, all at the
+start.
+
+So there *is* state in the save whose callbacks recovery would have to
+invalidate; what is missing is the precondition the capture gate insists on. This
+is a harness precondition blocker, not an absence of anything to measure, and a
+partial 50-tractor recovery row — save size, generation invalidation, coverage at
+zero — was not attempted. Widening the capture window would not help: the
+50-tractor benchmark ran 900,500 ticks, 33 times the capture window, and still
+completed zero tiles. The case becomes measurable once the bottleneck below is
+addressed. The artifact records it as `recovery_failed: 1`; "Blocked" here is a
+reading of that raw value, not a softer alternative to it.
 
 [^1]: production scale 25 tractor scenario timed out waiting for field completion after 450500 ticks. Reproduce with `.\tests\run-factorio-tests.ps1 -ScaleOnly -ScaleCounts 25`.
 [^2]: production scale 50 tractor scenario timed out waiting for field completion after 900500 ticks. Reproduce with `.\tests\run-factorio-tests.ps1 -ScaleOnly -ScaleCounts 50`.
@@ -309,24 +325,37 @@ was proven over the 8 machines that were live at that instant.
 
 ## Bottleneck
 
-The smallest observed bottleneck is **controller cadence, not CPU cost**.
+The smallest observed bottleneck is **controller service, not CPU cost** — and
+the service that is missing is distributed unevenly, not thinly.
 
-At fifty tractors the farming script update averages 0.2013 ms with a p95 of
-0.3655 ms — inside the 0.25 ms average and 0.50 ms p95 budgets — while the fleet
+At fifty tractors the farming script update averages 0.1962 ms with a p95 of
+0.3482 ms — inside the 0.25 ms average and 0.50 ms p95 budgets — while the fleet
 cultivates nothing whatsoever. The slice is not running out of frame time. No
 budget change would move any number in the table above, which is why the misses
 here are reported rather than answered with a relaxed gate.
 
-What decays is controller saturation: 100% at two tractors, 32.4% at ten, 11.5%
-at twenty-five, 5.9% at fifty — roughly 1/N. The scheduler applies
+Aggregate controller saturation decays roughly as 1/N: 100% at two tractors,
+32.4% at ten, 11.5% at twenty-five, 5.9% at fifty. The scheduler applies
 `movement.update` to exactly one due machine per tick while the controller runs
-on a 3-tick cadence, so a tractor is steered once every ~N ticks. Steering, the
-speed governor, waypoint arrival (`ARRIVAL_RADIUS = 0.9`) and stuck detection are
-all sampled only on a machine's own update tick, while the vehicle keeps driving
-under a persistent `riding_state`. Past roughly ten tractors a vehicle travels
-several tiles between samples and overshoots its 1–2 tile headland waypoints, so
-alignment never converges. Because the vehicle is still moving, `STUCK_DISTANCE`
-never trips: there is no failure and no recovery, only the deadline.
+on a 3-tick cadence, so the fleet as a whole is served a fixed number of times
+per tick regardless of its size.
+
+**That aggregate hides the sharper finding.** The shortfall is not spread evenly
+over the fleet. At twenty-five tractors, ten machines received no controller
+update at all, three received five, and the remaining twelve received about
+37,540 each. At fifty, every machine was served at least once but the range runs
+from 425 to 37,045 — an eighty-sevenfold spread. A subset of the fleet is served
+essentially in full while the rest is starved, so the failure is one of
+*selection*, not merely of budget. Raising the per-tick update count without
+addressing which machine comes due would raise the ceiling without fixing the
+distribution.
+
+Steering, the speed governor, waypoint arrival (`ARRIVAL_RADIUS = 0.9`) and stuck
+detection are all sampled only on a machine's own update tick, while the vehicle
+keeps driving under a persistent `riding_state`. A starved tractor travels far
+between samples and overshoots its 1–2 tile headland waypoints, so alignment
+never converges. Because the vehicle is still moving, `STUCK_DISTANCE` never
+trips: there is no failure and no recovery, only the deadline.
 
 Dispatch itself is not the limit. Maximum dispatch latency is 0 ticks at every
 scale, and at fifty tractors all fifty jobs were assigned and all fifty machines
@@ -342,10 +371,12 @@ an unforeseen defect.
 ### What this certifies
 
 The slice is certified for **exact completion at up to ten concurrently active
-tractors**, with save/load recovery proven at ten. The ceiling lies between ten
-and twenty-five; this characterization does not locate it more precisely, and no
-claim is made for any fleet larger than ten.
+tractors**, measured at two and ten, with save/load recovery proven at ten.
+Fleet sizes between three and nine were not run, so "up to ten" is an
+interpolation between two measured points rather than a swept result. The
+ceiling lies somewhere between ten and twenty-five; this characterization does
+not locate it more precisely, and no claim is made for any fleet larger than ten.
 
-The repair is tracked separately as issue #52, "Dispatch every due tractor
-per tick so the fleet scales past the reference case", and is deliberately
-not part of this characterization.
+The repair is tracked separately as issue #52, "Dispatch every due tractor per
+tick so the fleet scales past the reference case", and is deliberately not part
+of this characterization.
