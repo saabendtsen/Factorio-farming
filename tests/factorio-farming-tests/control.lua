@@ -894,12 +894,43 @@ local function capture_scale_recovery(run, snap)
     local job = scale_job(snap, id)
     captured.coverage[id] = job and job.completed_area or -1
   end
-  for _, machine in ipairs(snap.machines or {}) do captured.generations[machine.id] = machine.generation end
+  -- Record only the machines the production recovery contract actually bumps.
+  -- `recover_loaded_state` (scripts/slice.lua:525-535) advances a machine's
+  -- generation only while it still holds a job that is not `completed`: a
+  -- job-less or completed machine has no outstanding asynchronous callback to
+  -- invalidate, and recovery clears the whole path queue regardless
+  -- (slice.lua:514-516). Asserting strict advance over every machine in the
+  -- snapshot asserted an invariant production never promised, and at ten
+  -- tractors -- where the one-outstanding-request budget serializes dispatch
+  -- and a machine is routinely between jobs at the capture instant -- it
+  -- failed for that reason rather than for a stale callback. The replay
+  -- already skips a machine with no saved generation, so narrowing the capture
+  -- keeps the gate strong exactly where the invariant exists.
+  -- Resolved through `machine.job_id`, the same link `assignment_state`
+  -- follows, rather than by scanning jobs for a matching `machine_id`: the two
+  -- sides agree today, and if they ever stop agreeing this must track whatever
+  -- production would act on.
+  captured.generations_tracked = 0
+  for _, machine in ipairs(snap.machines or {}) do
+    local held = machine.job_id and scale_job(snap, machine.job_id)
+    if held and held.state ~= "completed" then
+      captured.generations[machine.id] = machine.generation
+      captured.generations_tracked = captured.generations_tracked + 1
+    end
+  end
+  -- A capture that tracks no machine proves nothing about stale-callback
+  -- invalidation, so it is a failure rather than a vacuous pass.
+  truthy(captured.generations_tracked > 0,
+    "scale capture recorded no live machine, so the replay could not prove stale-callback invalidation")
   storage.scale_recovery = captured
   game.auto_save("scale-" .. tostring(run.count) .. "-working")
   write_result("scale-" .. tostring(run.count) .. "-capture", {passed = true, count = run.count,
     capture_tick = snap.tick, pending_path_count = snap.pending_path_count,
     path_queue_depth = snap.path_queue_depth, outstanding_paths = snap.outstanding_paths,
+    -- How many machines the stale-callback invariant is proven over. Published
+    -- so the strength of that proof is visible in the artifact rather than
+    -- inferred from the fleet size.
+    generations_tracked = captured.generations_tracked,
     ledger = scale_ledger.summarize(run.ledger)})
   script.on_event(defines.events.on_tick, nil)
 end
@@ -1068,10 +1099,18 @@ local function drive_scale_replay(event)
       truthy(job.completed_area >= saved.coverage[id], "scale replay rewound authoritative coverage")
     end
 
-    -- Stale-callback invalidation. `recover_loaded_state` bumps every recovered
+    -- Stale-callback invalidation. `recover_loaded_state` bumps every RECOVERED
     -- machine's generation, so a saved asynchronous callback can no longer be
     -- believed. This is the strongest available evidence and it is checked
     -- first, because the pending-path observations below lean on it.
+    --
+    -- "Recovered" is the load-bearing word. A machine holding no job, or a
+    -- completed one, is deliberately not bumped (scripts/slice.lua:525-535):
+    -- it has no outstanding callback to invalidate. The capture therefore
+    -- records a generation only for machines that were live at the save, and a
+    -- machine with no saved generation is skipped here rather than asserted
+    -- over. `controller_generations_tracked` publishes the size of that set so
+    -- a pass cannot be read as stronger than what it proved.
     local generations_advanced = true
     for _, machine in ipairs(snap.machines or {}) do
       local generation = saved.generations[machine.id]
@@ -1132,6 +1171,9 @@ local function drive_scale_replay(event)
       pending_path_invalidated = replay.pending_path_invalidated,
       pending_path_budget_held = replay.pending_path_budget_held,
       controller_generations_advanced = replay.generations_advanced,
+      -- The number of machines the advance above was asserted over, so a pass
+      -- cannot be read as stronger than the set it was proven on.
+      controller_generations_tracked = saved.generations_tracked,
       pending_path_cleaned = replay.pending_path_cleaned, ledger = report})
     script.on_event(defines.events.on_tick, nil)
     return
@@ -1149,6 +1191,7 @@ local function drive_scale_replay(event)
       pending_path_invalidated = replay.pending_path_invalidated,
       pending_path_budget_held = replay.pending_path_budget_held,
       controller_generations_advanced = replay.generations_advanced,
+      controller_generations_tracked = saved.generations_tracked,
       pending_path_cleaned = replay.pending_path_cleaned,
       ledger = scale_ledger.summarize(replay.ledger), snapshot = snap})
     fail("production scale replay timed out")
